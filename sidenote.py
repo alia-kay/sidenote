@@ -1181,7 +1181,7 @@ def meet_key(title):
     return m.group(0) if m else (title or "").lower()
 
 
-SIDENOTE_VERSION = "2026-11-10 v6 (Mac + Windows merged)"
+SIDENOTE_VERSION = "2026-11-11 v7"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
