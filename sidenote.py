@@ -59,9 +59,9 @@ CUE_DELAY_SECONDS = 4          # wait this long after a cue phrase (sentence may
 MIN_SCAN_GAP_SECONDS = 30      # at most one scan every 30 s
 REGULAR_SCAN_SECONDS = 150     # safety-net scan when lots was said without cue phrases
 PAUSED_AFTER_SECONDS = 120      # no wait call for this long = Sidenote paused
-AUTOFILL_AFTER_SECONDS = 180    # auto title/agenda: first try after 3 min...
+AUTOFILL_AFTER_SECONDS = 180    # auto title/agenda: once, after 3 min...
 AUTOFILL_MIN_LINES = 30         # ...and at least 30 captured lines
-AUTOFILL_RETRY_SECONDS = 600    # one retry at 10 min if still empty
+REPEAT_WINDOW_SECONDS = 10      # skip a line that repeats (or is the tail of) one this recent
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
@@ -159,6 +159,7 @@ class Transcript:
         self.skip_visible = True          # next read only marks on-screen captions as seen
         self.entries = []                 # list of (datetime, sentence)
         self.recent = deque(maxlen=400)   # normalized recent sentences
+        self.recent_words = deque(maxlen=30)   # (datetime, speaker, words) of recent lines
         self.last_final = None            # last sentence committed (raw)
         self.pending = ""                 # sentence still being spoken
         self.started = datetime.datetime.now()
@@ -171,7 +172,7 @@ class Transcript:
             live.scanned_upto = 0
             live.quiet_rounds = 0
             live.last_scan = 0.0
-            live.autofill_tries = 0
+            live.autofill_sent = False
         except NameError:
             pass
         with self.lock:
@@ -336,7 +337,7 @@ class Transcript:
                 key = norm(sentence)
                 if not key or key in self.recent:
                     continue        # duplicate or a punctuation-only revision
-                self._commit(now, f"{speaker}: {sentence}" if speaker else sentence, key)
+                self._commit(now, f"{speaker}: {sentence}" if speaker else sentence, key, speaker)
                 self._note_cues(sentence)
                 if speaker:
                     self.others_recent.append((time.time(), key))
@@ -363,14 +364,35 @@ class Transcript:
             for sentence in SENTENCE_SPLIT.split(text):
                 k = norm(speaker + sentence)
                 if norm(sentence) and k not in self.recent:
-                    self._commit(now, f"{speaker}: {sentence}", k)
+                    self._commit(now, f"{speaker}: {sentence}", k, speaker)
                     self._note_cues(sentence)
         return True
 
-    def _commit(self, now, line, key):
+    def _is_repeat(self, now, speaker, words):
+        """True if words are identical to, or the end of, a line from the same
+        speaker captured in the last REPEAT_WINDOW_SECONDS. Live Captions re-sends
+        a line several times, each copy shorter ('I also will review files',
+        'also will review files', 'will review files', ...)."""
+        if not words:
+            return False
+        n = len(words)
+        for t, spk, prev in self.recent_words:
+            if spk == speaker and (now - t).total_seconds() <= REPEAT_WINDOW_SECONDS \
+                    and len(prev) >= n and prev[-n:] == words:
+                return True
+        return False
+
+    def _commit(self, now, line, key, speaker=""):
         """Add a finished sentence. If captions extended the previous sentence
         ('I added' -> 'I added X to the agenda'), replace it instead of adding a
-        second, longer copy. A shorter re-send of a sentence we have is skipped."""
+        second, longer copy. A shorter re-send of a sentence we have is skipped,
+        and so is a repeat or the tail end of a line captured seconds ago."""
+        sentence = line[len(speaker) + 2:] if speaker else line
+        words = tuple(re.findall(r"\w+", sentence.lower()))
+        if self._is_repeat(now, speaker, words):
+            self.recent.append(key)
+            return False
+        self.recent_words.append((now, speaker, words))
         last = self.entries[-1] if self.entries else None
         last_key = getattr(self, "_last_key", "")
         if last and last_key and (now - last[0]).total_seconds() < 20:
@@ -417,7 +439,7 @@ class Transcript:
                     key = norm(speaker + sentence)
                     if not norm(sentence) or key in self.recent:
                         continue
-                    self._commit(now, f"{speaker}: {sentence}" if speaker else sentence, key)
+                    self._commit(now, f"{speaker}: {sentence}" if speaker else sentence, key, speaker)
                     self._note_cues(sentence)
             self.pending = pending
 
@@ -608,7 +630,7 @@ class LiveState:
         self.last_scan = 0.0     # when Claude last scanned the transcript
         self.released = False    # Claude stopped listening after an ended meeting
         self.scanned_upto = 0    # transcript lines already scanned
-        self.autofill_tries = 0  # auto title/agenda requests sent this meeting
+        self.autofill_sent = False  # auto title/agenda note already sent this meeting
 
     def label(self):
         if self.released:
@@ -1890,9 +1912,10 @@ mcp = FastMCP(
         "topics that are not already on it), and agenda items that are now clearly "
         "covered (mark_done kind 'agenda'). Then immediately call wait_for_question "
         "again. Never call show_suggestion for a scan.\n\n"
-        "AUTOFILL: if the meeting still has no title or agenda after a few minutes, "
-        "wait_for_question returns AUTOFILL. Set only the missing fields (a short "
-        "title, 1-2 agenda topics) with update_meeting_info, then keep listening.\n\n"
+        "AUTO TITLE: once per meeting, if there is still no title after a few minutes, "
+        "a SCAN adds an AUTO TITLE note. Follow it: set a short title (and 1-2 agenda "
+        "topics only if the agenda is empty) with update_meeting_info, never changing "
+        "what the user typed or stated.\n\n"
         "CONTEXT: (1) Right after open_sidenote, FIRST check whether you have Jira "
         "and/or Confluence tools in this conversation (tool names containing jira, "
         "atlassian or confluence; count deferred tools too and load them via tool "
@@ -2016,30 +2039,29 @@ def core_close_sidenote():
     return "Sidenote closed and the meeting ended."
 
 
-def _autofill_if_ready():
-    """Once the meeting has run a while, ask Claude to fill an empty title
-    and/or agenda from the transcript. First try at 3 min (30+ lines), one
-    retry at 10 min if still empty. Never touches what the user already set."""
+def _autofill_note():
+    """One-time AUTO TITLE note for a SCAN: once the meeting has run 3+ min with
+    30+ lines and still has no title, ask Claude for a short title (and 1-2
+    agenda items only if the agenda is empty). Sent at most once per meeting."""
     c = transcript.context
-    missing = [k for k in ("title", "agenda") if not c[k]]
-    if not missing or live.autofill_tries >= 2:
-        return None
+    if live.autofill_sent or c["title"]:
+        return ""
     elapsed = (datetime.datetime.now() - transcript.started).total_seconds()
-    wait = AUTOFILL_AFTER_SECONDS if live.autofill_tries == 0 else AUTOFILL_RETRY_SECONDS
-    if elapsed < wait or transcript.count_lines() < AUTOFILL_MIN_LINES:
-        return None
-    live.autofill_tries += 1
-    asks = []
-    if "title" in missing:
-        asks.append("title: a short meeting title, 8 words max")
-    if "agenda" in missing:
-        asks.append("agenda: 1 or 2 main topics actually discussed (one per line)")
-    return ("AUTOFILL: the meeting has no " + " and no ".join(missing) + " yet. From the "
-            "transcript below, call update_meeting_info with ONLY these fields: "
-            + "; ".join(asks) + ". Leave every other field empty so nothing the user "
-            "set is changed. If the talk is too unclear to tell, save nothing. Do not "
-            "call show_suggestion. Then call wait_for_question again.\n\n"
-            f"--- TRANSCRIPT, LAST 10 MIN ---\n{transcript.since(10) or '(nothing captured)'}")
+    if elapsed < AUTOFILL_AFTER_SECONDS or transcript.count_lines() < AUTOFILL_MIN_LINES:
+        return ""
+    live.autofill_sent = True
+    if c["agenda"]:
+        fields = ("ONLY the title field: a short meeting title, 8 words max. The agenda "
+                  "already exists: do not pass agenda")
+    else:
+        fields = ("ONLY title (a short meeting title, 8 words max) and agenda (1 or 2 "
+                  "main topics actually discussed, one per line; never 3 or more)")
+    return ("\n\nAUTO TITLE (one time): the meeting has no title yet. Also call "
+            f"update_meeting_info with {fields}. Leave every other field empty. If "
+            "someone stated the meeting's title or agenda in the transcript, use their "
+            "words. If the talk is too unclear to tell, skip this.\n\n"
+            "--- TRANSCRIPT, LAST 10 MIN (for the title) ---\n"
+            f"{transcript.since(10) or '(nothing captured)'}")
 
 
 def context_guidance(full=True):
@@ -2070,9 +2092,6 @@ def _scan_if_ready():
     new talk has piled up since the last check."""
     if transcript.ended_at:
         return None
-    autofill = _autofill_if_ready()
-    if autofill:
-        return autofill
     now = time.time()
     total = transcript.count_lines()
     new_lines = total - live.scanned_upto
@@ -2122,7 +2141,7 @@ def _scan_if_ready():
             "again.\n\n"
             f"--- CURRENT LISTS ---\n{transcript.context_text()}\n\n"
             f"--- NEW TRANSCRIPT ---\n{transcript.lines_from(start)}"
-            + context_guidance())
+            + _autofill_note() + context_guidance())
 
 
 def core_wait_for_question(timeout_seconds=WAIT_DEFAULT_SECONDS):
