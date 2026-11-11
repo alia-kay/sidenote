@@ -2672,6 +2672,9 @@ class Overlay:
                                    justify="left", font=(FONT, 9))
         self.info_label.pack(fill="x", pady=(2, 0))
         self.info_label.bind("<Button-1>", lambda e: self._edit_info_from_click())
+        # Testing aid: which Sidenote build is running (remove before release)
+        tk.Label(titles, text=SIDENOTE_VERSION, bg=BG, fg=FAINT, anchor="w",
+                 justify="left", font=(FONT, 7)).pack(fill="x", pady=(1, 0))
 
         # View toggles: open lists next to the answer when you want them
         chips = tk.Frame(self.root, bg=BG)
