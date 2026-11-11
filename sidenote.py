@@ -18,6 +18,7 @@ Requirements:
 import asyncio
 import atexit
 import datetime
+import difflib
 import logging
 import os
 import queue
@@ -60,8 +61,17 @@ MIN_SCAN_GAP_SECONDS = 30      # at most one scan every 30 s
 REGULAR_SCAN_SECONDS = 150     # safety-net scan when lots was said without cue phrases
 PAUSED_AFTER_SECONDS = 120      # no wait call for this long = Sidenote paused
 AUTOFILL_AFTER_SECONDS = 180    # auto title/agenda: once, after 3 min...
-AUTOFILL_MIN_LINES = 30         # ...and at least 30 captured lines
+AUTOFILL_MIN_LINES = 30         # ...and 30 spoken lines (questions/answers not counted)
+AUTOFILL_MIN_WORDS = 100        # ...or 100 spoken words (Live Captions lines run long)
 REPEAT_WINDOW_SECONDS = 10      # skip a line that repeats (or is the tail of) one this recent
+REPEAT_LONG_SECONDS = 60        # ...or this recent, when the repeat is 4+ words long
+REPEAT_LONG_WORDS = 4
+STALE_WORDS = 8                 # 8+ words found inside a line from the last...
+STALE_SECONDS = 600             # ...10 min = old caption text read again: skip it
+REVISION_MIN_WORDS = 6          # a 6+ word line that is...
+REVISION_SIMILARITY = 0.8       # ...80% the same as one from the last...
+REVISION_SECONDS = 20           # ...20 s is a corrected re-send: replace that line
+NOTE_PREFIXES = ("YOU ASKED:", "CLAUDE:", "MEETING ENDED")   # transcript lines nobody said
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
@@ -159,7 +169,7 @@ class Transcript:
         self.skip_visible = True          # next read only marks on-screen captions as seen
         self.entries = []                 # list of (datetime, sentence)
         self.recent = deque(maxlen=400)   # normalized recent sentences
-        self.recent_words = deque(maxlen=30)   # (datetime, speaker, words) of recent lines
+        self.recent_words = deque(maxlen=300)  # [datetime, speaker, words, entry index]
         self.last_final = None            # last sentence committed (raw)
         self.pending = ""                 # sentence still being spoken
         self.started = datetime.datetime.now()
@@ -369,30 +379,65 @@ class Transcript:
         return True
 
     def _is_repeat(self, now, speaker, words):
-        """True if words are identical to, or the end of, a line from the same
-        speaker captured in the last REPEAT_WINDOW_SECONDS. Live Captions re-sends
-        a line several times, each copy shorter ('I also will review files',
-        'also will review files', 'will review files', ...)."""
+        """True if this line is a re-send of one already captured from the same
+        speaker. Live Captions re-sends lines in two ways:
+          - each copy shorter ('I also will review files', 'also will review
+            files', ...): identical or the end of a line from the last
+            REPEAT_WINDOW_SECONDS (REPEAT_LONG_SECONDS for 4+ words);
+          - old text read again from its buffer minutes later: 8+ words found
+            anywhere inside a line from the last STALE_SECONDS."""
         if not words:
             return False
         n = len(words)
-        for t, spk, prev in self.recent_words:
-            if spk == speaker and (now - t).total_seconds() <= REPEAT_WINDOW_SECONDS \
-                    and len(prev) >= n and prev[-n:] == words:
+        window = REPEAT_LONG_SECONDS if n >= REPEAT_LONG_WORDS else REPEAT_WINDOW_SECONDS
+        for t, spk, prev, _ in self.recent_words:
+            if spk != speaker or len(prev) < n:
+                continue
+            age = (now - t).total_seconds()
+            if age <= window and prev[-n:] == words:
+                return True
+            if n >= STALE_WORDS and age <= STALE_SECONDS and any(
+                    prev[i:i + n] == words for i in range(len(prev) - n + 1)):
                 return True
         return False
 
+    def _find_revision(self, now, speaker, words):
+        """The recent line this one corrects, if any. Live Captions sometimes
+        sends a finished line again a second later with a word changed ('fit all
+        the pony' -> 'fit all a pony'). Only for lines of REVISION_MIN_WORDS+ words,
+        REVISION_SIMILARITY alike, from the last REVISION_SECONDS."""
+        if len(words) < REVISION_MIN_WORDS:
+            return None
+        for rec in reversed(self.recent_words):
+            t, spk, prev, idx = rec
+            if (now - t).total_seconds() > REVISION_SECONDS:
+                break
+            if spk == speaker and len(prev) >= REVISION_MIN_WORDS and \
+                    difflib.SequenceMatcher(None, prev, words).ratio() >= REVISION_SIMILARITY:
+                return rec
+        return None
+
     def _commit(self, now, line, key, speaker=""):
         """Add a finished sentence. If captions extended the previous sentence
-        ('I added' -> 'I added X to the agenda'), replace it instead of adding a
-        second, longer copy. A shorter re-send of a sentence we have is skipped,
-        and so is a repeat or the tail end of a line captured seconds ago."""
+        ('I added' -> 'I added X to the agenda') or corrected a recent one ('fit
+        all the pony' -> 'fit all a pony'), replace it instead of adding a second
+        copy. A shorter re-send, the tail end of a recent line, and old text read
+        again from the captions buffer are skipped."""
         sentence = line[len(speaker) + 2:] if speaker else line
         words = tuple(re.findall(r"\w+", sentence.lower()))
         if self._is_repeat(now, speaker, words):
             self.recent.append(key)
             return False
-        self.recent_words.append((now, speaker, words))
+        rec = self._find_revision(now, speaker, words)
+        if rec is not None and rec[3] < len(self.entries):
+            idx = rec[3]
+            self.entries[idx] = (self.entries[idx][0], line)   # keep the first time
+            rec[2] = words
+            if idx == len(self.entries) - 1:
+                self._last_key = key
+            self.recent.append(key)
+            self.dirty = True
+            return True
         last = self.entries[-1] if self.entries else None
         last_key = getattr(self, "_last_key", "")
         if last and last_key and (now - last[0]).total_seconds() < 20:
@@ -400,6 +445,7 @@ class Transcript:
                 self.entries[-1] = (last[0], line)
                 self._last_key = key
                 self.recent.append(key)
+                self.recent_words.append([now, speaker, words, len(self.entries) - 1])
                 self.dirty = True
                 return True
             if last_key.startswith(key):
@@ -408,6 +454,7 @@ class Transcript:
         self.entries.append((now, line))
         self._last_key = key
         self.recent.append(key)
+        self.recent_words.append([now, speaker, words, len(self.entries) - 1])
         self.dirty = True
         return True
 
@@ -575,6 +622,25 @@ class Transcript:
             if self.pending:
                 items.append(self.pending)
         return " ".join(items[-n:])
+
+    def spoken_stats(self):
+        """(lines, words) actually said in the meeting: typed questions,
+        Claude's answers and the end marker are not counted."""
+        with self.lock:
+            spoken = [s for _, s in self.entries if not s.startswith(NOTE_PREFIXES)]
+        return len(spoken), sum(len(s.split()) for s in spoken)
+
+    def conversation(self):
+        """[(time, 'you' or 'claude', text)] for every question and answer."""
+        with self.lock:
+            items = list(self.entries)
+        out = []
+        for t, s in items:
+            if s.startswith("YOU ASKED:"):
+                out.append((t, "you", s[len("YOU ASKED:"):].strip()))
+            elif s.startswith("CLAUDE:"):
+                out.append((t, "claude", s[len("CLAUDE:"):].strip()))
+        return out
 
     def stats(self):
         with self.lock:
@@ -2039,16 +2105,24 @@ def core_close_sidenote():
     return "Sidenote closed and the meeting ended."
 
 
-def _autofill_note():
-    """One-time AUTO TITLE note for a SCAN: once the meeting has run 3+ min with
-    30+ lines and still has no title, ask Claude for a short title (and 1-2
-    agenda items only if the agenda is empty). Sent at most once per meeting."""
-    c = transcript.context
-    if live.autofill_sent or c["title"]:
-        return ""
+def _autofill_ready():
+    """True once the meeting has run 3+ min, has 30+ spoken lines or 100+ spoken
+    words, still has no title, and the AUTO TITLE note hasn't been sent yet."""
+    if live.autofill_sent or transcript.context["title"] or transcript.ended_at:
+        return False
     elapsed = (datetime.datetime.now() - transcript.started).total_seconds()
-    if elapsed < AUTOFILL_AFTER_SECONDS or transcript.count_lines() < AUTOFILL_MIN_LINES:
+    if elapsed < AUTOFILL_AFTER_SECONDS:
+        return False
+    lines, words = transcript.spoken_stats()
+    return lines >= AUTOFILL_MIN_LINES or words >= AUTOFILL_MIN_WORDS
+
+
+def _autofill_note():
+    """One-time AUTO TITLE note for a SCAN: ask Claude for a short title (and
+    1-2 agenda items only if the agenda is empty). Sent at most once per meeting."""
+    if not _autofill_ready():
         return ""
+    c = transcript.context
     live.autofill_sent = True
     if c["agenda"]:
         fields = ("ONLY the title field: a short meeting title, 8 words max. The agenda "
@@ -2056,10 +2130,11 @@ def _autofill_note():
     else:
         fields = ("ONLY title (a short meeting title, 8 words max) and agenda (1 or 2 "
                   "main topics actually discussed, one per line; never 3 or more)")
-    return ("\n\nAUTO TITLE (one time): the meeting has no title yet. Also call "
-            f"update_meeting_info with {fields}. Leave every other field empty. If "
-            "someone stated the meeting's title or agenda in the transcript, use their "
-            "words. If the talk is too unclear to tell, skip this.\n\n"
+    return ("\n\nAUTO TITLE (one time, required): the meeting has no title yet. Besides "
+            f"the scan, call update_meeting_info with {fields}. Leave every other field "
+            "empty. If someone stated the meeting's title or agenda in the transcript, "
+            "use their words. Captions can be messy: still pick the best short title "
+            "(a broad one like 'Sidenote testing' is fine) rather than skipping.\n\n"
             "--- TRANSCRIPT, LAST 10 MIN (for the title) ---\n"
             f"{transcript.since(10) or '(nothing captured)'}")
 
@@ -2124,11 +2199,14 @@ def _scan_if_ready():
                 f"--- MEETING INFO ---\n{transcript.context_text()}")
     if not has_sources:
         transcript.tickets_new = []
-    if new_lines <= 0:
+    # The one-time auto title goes out with a SCAN as soon as it is due,
+    # without waiting for a cue phrase or the regular scan
+    autofill_due = _autofill_ready() and since_scan >= 10
+    if new_lines <= 0 and not autofill_due:
         return None
     cue = transcript.cue_at > live.last_scan and now - transcript.cue_at >= CUE_DELAY_SECONDS
     regular = new_lines >= 8 and since_scan >= REGULAR_SCAN_SECONDS
-    if not ((cue and since_scan >= MIN_SCAN_GAP_SECONDS) or regular):
+    if not ((cue and since_scan >= MIN_SCAN_GAP_SECONDS) or regular or autofill_due):
         return None
     start = max(0, live.scanned_upto - 2)          # 2 lines of overlap for context
     live.scanned_upto = total
@@ -2176,7 +2254,6 @@ def core_wait_for_question(timeout_seconds=WAIT_DEFAULT_SECONDS):
                 return _end_instructions("END")
             live.quiet_rounds = 0
             if question == MISSED_TOKEN:
-                transcript.add_note("YOU ASKED", "What did I miss?")
                 recent = transcript.since(MISSED_MINUTES)
                 return (
                     f"QUESTION: What did I miss? Summarize the last {MISSED_MINUTES} minutes "
@@ -2188,7 +2265,6 @@ def core_wait_for_question(timeout_seconds=WAIT_DEFAULT_SECONDS):
                     f"--- TRANSCRIPT, LAST {MISSED_MINUTES} MIN ---\n"
                     f"{recent or '(nothing captured)'}"
                 )
-            transcript.add_note("YOU ASKED", question)
             if question.strip().lower() in ("stop", "stop sidenote", "end"):
                 end_if_needed()
                 return _end_instructions("STOP")
@@ -2819,15 +2895,10 @@ class Overlay:
         body = tk.Frame(self.paned, bg=BG)
         self.paned.add(body, minsize=60, stretch="always")
         self.body = body
-        head = tk.Frame(body, bg=BG)
-        head.pack(fill="x", pady=(2, 0))
-        tk.Label(head, text="Claude", bg=BG, fg=FG, font=(FONT, 9, "bold"),
-                 anchor="w").pack(side="left")
-        self.question_label = tk.Label(head, text="", bg=BG, fg=FAINT, anchor="w",
-                                       justify="left", font=(FONT, 8))
-        self.question_label.pack(side="left", padx=(8, 0), fill="x", expand=True)
         card = tk.Frame(body, bg=SURFACE)
-        card.pack(fill="both", expand=True, pady=(6, 0))
+        card.pack(fill="both", expand=True, pady=(8, 0))
+        # The conversation, like in Claude: your message, then Claude's reply.
+        # Newest exchange on top; scroll down for the earlier ones.
         self.answer = tk.Text(card, wrap="word", bg=SURFACE, fg=FG, relief="flat",
                               font=(FONT, 10), padx=14, pady=10, borderwidth=0,
                               highlightthickness=0, spacing2=2, spacing3=5, cursor="arrow",
@@ -2835,6 +2906,22 @@ class Overlay:
         self.answer.pack(side="left", fill="both", expand=True)
         self.answer.tag_configure("hint", foreground=FAINT, font=(FONT, 9))
         self.answer.tag_configure("muted", foreground=MUTED)
+        self.answer.tag_configure("you_name", foreground=MUTED, font=(FONT, 8, "bold"),
+                                  spacing3=2)
+        self.answer.tag_configure("claude_name", foreground=ACCENT, font=(FONT, 8, "bold"),
+                                  spacing1=6, spacing3=2)
+        self.answer.tag_configure("time", foreground=FAINT, font=(FONT, 8))
+        self.answer.tag_configure("you", foreground=FG, background=SURFACE_HI,
+                                  lmargin1=0, lmargin2=0)
+        self.answer.tag_configure("claude", foreground=FG)
+        self.answer.tag_configure("divider", foreground=LINE, font=(FONT, 6),
+                                  spacing1=6, spacing3=6)
+        self.answer.tag_configure("notice_name", foreground=MUTED, font=(FONT, 8, "bold"),
+                                  spacing3=2)
+        self.answer.tag_configure("notice", foreground=MUTED)
+        self._notice = None            # status shown above the conversation (or None)
+        self._pending_hint = "Thinking…"   # under a question Claude hasn't answered yet
+        self._feed_sig = None          # what the conversation view shows now
 
         if transcript.ended_at:
             self.end_btn.configure(text="Ended", fg=FAINT, cursor="arrow")
@@ -2989,22 +3076,68 @@ class Overlay:
                 self.root.after_cancel(self._geo_job)
             self._geo_job = self.root.after(800, self._remember_geometry)
             width = max(200, event.width - 32)
-            for label in (self.tail, self.info_label, self.question_label, self.title_label):
-                label.configure(wraplength=width - (40 if label is self.title_label else
-                                                    80 if label is self.question_label else 0))
+            for label in (self.tail, self.info_label, self.title_label):
+                label.configure(wraplength=width - (40 if label is self.title_label else 0))
 
-    def _set_answer(self, text, empty=False):
-        self.answer.configure(state="normal")
-        self.answer.delete("1.0", "end")
-        if empty:
+    def _set_answer(self, text, empty=False, label=""):
+        """Show a status (e.g. 'Meeting ended...', the recap) above the
+        conversation, or clear it (empty=True)."""
+        self._notice = None if empty or not text else (label, text)
+        self._render_feed(force=True)
+
+    def _exchanges(self):
+        """The conversation grouped as [{'q': (time, text) or None, 'a': [(time, text)]}],
+        oldest first. A Claude message with no question before it gets q=None."""
+        out = []
+        for t, who, body in transcript.conversation():
+            if who == "you":
+                out.append({"q": (t, body), "a": []})
+            else:
+                if not out:
+                    out.append({"q": None, "a": []})
+                out[-1]["a"].append((t, body))
+        return out
+
+    def _render_feed(self, force=False):
+        exchanges = self._exchanges()
+        sig = (tuple((e["q"], tuple(e["a"])) for e in exchanges[-1:]), len(exchanges),
+               self._notice, self._pending_hint)
+        if not force and sig == self._feed_sig:
+            return
+        self._feed_sig = sig
+        a = self.answer
+        a.configure(state="normal")
+        a.delete("1.0", "end")
+        if self._notice:
+            label, text = self._notice
+            if label:
+                a.insert("end", label + "\n", "notice_name")
+            a.insert("end", text + "\n", "notice")
+        if not exchanges and not self._notice:
             no_info = not (transcript.context["title"] or transcript.context["agenda"])
             hint = ("Add the title, agenda and your role from the title above.  "
                     if no_info else "")
-            self.answer.insert("1.0", hint + "Ask anything, e.g. \u201cWhat should I ask now?\u201d "
-                               "or \u201cWhich agenda items haven't we covered?\u201d", "hint")
-        else:
-            self.answer.insert("1.0", text)
-        self.answer.configure(state="disabled")
+            a.insert("end", hint + "Ask anything, e.g. \u201cWhat should I ask now?\u201d "
+                     "or \u201cWhich agenda items haven't we covered?\u201d", "hint")
+        for i, ex in enumerate(reversed(exchanges)):      # newest first
+            if i or self._notice:
+                a.insert("end", "\u2500" * 12 + "\n", "divider")
+            if ex["q"]:
+                t, text = ex["q"]
+                a.insert("end", "You", "you_name")
+                a.insert("end", f"  {t.strftime('%H:%M')}\n", "time")
+                a.insert("end", text + "\n", "you")
+            for t, text in ex["a"]:
+                a.insert("end", "Claude", "claude_name")
+                a.insert("end", f"  {t.strftime('%H:%M')}\n", "time")
+                a.insert("end", text + "\n", "claude")
+            if ex["q"] and not ex["a"]:
+                a.insert("end", "Claude\n", "claude_name")
+                a.insert("end", self._pending_hint + "\n", "hint")
+        if a.get("end-2c", "end-1c") == "\n":
+            a.delete("end-2c", "end-1c")      # no empty line at the very bottom
+        a.configure(state="disabled")
+        a.yview_moveto(0)                 # newest is on top
         self.root.after(30, self._layout)
 
     def _answer_lines(self):
@@ -3228,7 +3361,7 @@ class Overlay:
         fields["title"].focus_set()
 
     def _answer_is_empty_state(self):
-        return "Ask anything, e.g." in self.answer.get("1.0", "end")
+        return not self._notice and not transcript.conversation()
 
     def handle_local_command(self, text):
         """'agenda: X', 'role: X', 'title: X', 'participants: X' are saved directly."""
@@ -3273,14 +3406,19 @@ class Overlay:
         self._update_suggestions()
         if self.handle_local_command(text):
             return
-        question_queue.put(text)
-        short = text if len(text) <= 48 else text[:46].rstrip() + "\u2026"
-        self.question_label.configure(text=f"\u2014  you asked: {short}")
+        self._ask(text, text, "Thinking\u2026")
+
+    def _ask(self, shown, token, working):
+        """Put the question in the conversation right away (newest on top) and
+        hand it to Claude. working: shown under it until Claude replies."""
+        transcript.add_note("YOU ASKED", shown)
+        question_queue.put(token)
         if live.waiting or live.label().startswith("Claude"):
-            self._set_answer("Thinking...")
+            self._pending_hint = working
         else:
-            self._set_answer("Saved. Claude will answer as soon as Sidenote is connected "
-                             "(type 'continue' in the Claude app if it stays paused).")
+            self._pending_hint = ("Saved. Claude will answer as soon as Sidenote is connected "
+                                  "(type 'continue' in the Claude app if it stays paused).")
+        self._set_answer("", empty=True)      # a new question clears old status notes
 
     def what_did_i_miss(self, _event=None):
         if transcript.ended_at:
@@ -3289,13 +3427,7 @@ class Overlay:
         if not transcript.since(MISSED_MINUTES):
             self.toast(f"Nothing captured in the last {MISSED_MINUTES} minutes")
             return
-        question_queue.put(MISSED_TOKEN)
-        self.question_label.configure(text=f"\u2014  you asked: {self.MISSED_PROMPT}")
-        if live.waiting or live.label().startswith("Claude"):
-            self._set_answer("Catching you up...")
-        else:
-            self._set_answer("Saved. Claude will answer as soon as Sidenote is connected "
-                             "(type 'continue' in the Claude app if it stays paused).")
+        self._ask("What did I miss?", MISSED_TOKEN, "Catching you up\u2026")
 
     def new_meeting(self):
         from tkinter import messagebox
@@ -3315,7 +3447,6 @@ class Overlay:
         self._hover(self.end_btn, BG, SURFACE, fg_on=FG, fg_off=MUTED)
         self.update_info()
         self.refresh_lists()
-        self.question_label.configure(text="")
         self._set_answer("", empty=True)
         self.toast(message, seconds=8)
 
@@ -3347,7 +3478,6 @@ class Overlay:
         self.end_btn.configure(text="Ended", fg=FAINT, cursor="arrow")
         self.end_btn.unbind("<Enter>")
         self.end_btn.unbind("<Leave>")
-        self.question_label.configure(text="")
         connected = live.waiting or live.label().startswith("Claude")
         if connected:
             question_queue.put(END_TOKEN)
@@ -3424,11 +3554,14 @@ class Overlay:
                 if kind == "lists":
                     self.refresh_lists(flash=payload)
                 if kind == "suggestion":
-                    self._set_answer(payload)
+                    conv = transcript.conversation()
+                    if conv and conv[-1][1] == "claude" and conv[-1][2] == payload.strip():
+                        self._render_feed()            # Claude's reply: already in the feed
+                    else:
+                        self._set_answer(payload)      # a status message
                     self.root.deiconify()
                 if kind == "recap" and transcript.ended_at:
-                    self.question_label.configure(text="\u2014  recap, saved in the meeting file")
-                    self._set_answer(payload)
+                    self._set_answer(payload, label="Recap \u00b7 saved in the meeting file")
                     self.toast("Meeting saved", seconds=6)
         except queue.Empty:
             pass
@@ -3461,6 +3594,10 @@ class Overlay:
         if time.time() - getattr(self, "_last_fit", 0) > 1.5:
             self._last_fit = time.time()
             self._fit_chips()
+        try:
+            self._render_feed()
+        except Exception as e:
+            log.info("Conversation view update failed: %s", e)
         self.root.after(300, self.refresh)
 
     # ---- lists: actions, questions, transcript ---------------------------------
