@@ -13,5 +13,6 @@ See SIDENOTE.md for the full feature list.
 - sidenote.py: the whole app (a local MCP server started by the Claude desktop app)
 - requirements.txt: Python packages it needs
 - SIDENOTE.md: objective and feature list
+- install_mac.sh and READ ME FIRST.txt: Mac installer and setup steps
 
 Meeting transcripts are saved on your own computer in Documents/Sidenote and are never part of this repository.

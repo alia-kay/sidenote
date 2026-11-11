@@ -1,0 +1,76 @@
+Sidenote for Mac - setup (about 10 minutes)
+
+Sidenote is a small meeting assistant for the Claude desktop app. It reads live
+captions during a call and answers your questions in a small window.
+
+You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
+
+1. Install Python (skip if you already have it)
+   Download the macOS installer from https://www.python.org/downloads/ and run it.
+
+2. Put this Sidenote folder somewhere it can stay, for example in Documents.
+   Don't move or rename it after step 3: Claude is set up to run Sidenote from
+   this exact place. If you do move it, run step 3 again.
+
+3. Run the installer
+   Open Terminal (Spotlight: type Terminal), type   bash   followed by a space,
+   drag install_mac.sh from this folder into the Terminal window, press Return.
+   Wait until it says Done.
+   If it says "Sidenote needs Python 3.10 or newer", do step 1, then run this
+   step again.
+
+4. Quit Claude completely (Cmd+Q) and open it again.
+
+5. Allow Claude to read other apps
+   System Settings > Privacy & Security, then scroll down the list on the right
+   and click "Device Control and Data Access" (on older macOS it is called
+   "Accessibility" and is near the top of that list). Turn ON Claude.
+   If Claude isn't in the list, click + at the bottom, choose
+   Applications > Claude, and confirm with your password or Touch ID.
+   Note: the "Accessibility" item in the left sidebar of System Settings is a
+   different page (display and zoom settings). Don't use that one here.
+   Then quit and reopen Claude once more.
+
+6. Use it
+   In a Claude chat, type: open Sidenote
+   - Google Meet (in Chrome): Sidenote turns on Meet's captions by itself
+     (the CC button) and reads them, including your own voice. If captions
+     don't come on within a few seconds, press CC yourself. If you turn
+     captions off during the call, Sidenote leaves them off.
+   - Other apps (Zoom, Teams, videos): Sidenote turns on macOS Live Captions by
+     itself and hides its window. Note: this hears the other people, not your
+     own microphone.
+   Type a question in the Sidenote window and press Ask.
+   If the status stays on "Connecting to Claude", type continue in the Claude chat.
+   Close the Sidenote window to end the meeting. Meeting notes are saved in
+   Documents/Sidenote.
+
+If macOS asks whether Claude may access your Documents folder, allow it.
+Everything stays on your computer except what you send to Claude.
+
+
+If something goes wrong
+
+- Claude says Sidenote is open, but you can't see the window:
+  An old copy of Sidenote is probably stuck in the background.
+  1. Quit Claude (Cmd+Q).
+  2. In Terminal, type this and press Return:
+        sudo pkill -f sidenote.py
+     Type your Mac password and press Return. The letters don't show while you
+     type; that's normal. (Without "sudo", macOS answers "Operation not
+     permitted".)
+  3. Open Claude again and type: open Sidenote
+
+- To check that Sidenote itself works, outside Claude:
+  1. Quit Claude (Cmd+Q).
+  2. In Terminal, type   cd   and a space, drag this Sidenote folder into the
+     Terminal window, and press Return.
+  3. Type this and press Return:
+        .venv/bin/python sidenote.py
+  The Sidenote window should appear. If it shows an error instead, take a
+  screenshot of Terminal. Close the window when you're done, then open Claude
+  again.
+
+- Sidenote says "Live Captions not found":
+  Turn Live Captions on yourself: System Settings > Accessibility (left
+  sidebar) > Live Captions. Google Meet captions don't need this.
