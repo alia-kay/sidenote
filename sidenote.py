@@ -2617,7 +2617,7 @@ class Overlay:
         if IS_MAC:
             # macOS draws a 9 pt Tk font as 9 px; scale up to normal Mac text sizes
             self.root.tk.call("tk", "scaling", MAC_UI_SCALE)
-        self.root.title("Sidenote")
+        self.root.title(f"Sidenote {SIDENOTE_VERSION}")
         try:
             self._icons = [tk.PhotoImage(data=ICON_64), tk.PhotoImage(data=ICON_32)]
             self.root.iconphoto(True, *self._icons)
@@ -2670,11 +2670,7 @@ class Overlay:
         self.title_label.bind("<Button-1>", lambda e: self._edit_info_from_click())
         self.info_label = tk.Label(titles, text="", bg=BG, fg=MUTED, anchor="w",
                                    justify="left", font=(FONT, 9))
-        self.info_label.pack(fill="x", pady=(2, 0))
         self.info_label.bind("<Button-1>", lambda e: self._edit_info_from_click())
-        # Testing aid: which Sidenote build is running (remove before release)
-        tk.Label(titles, text=SIDENOTE_VERSION, bg=BG, fg=FAINT, anchor="w",
-                 justify="left", font=(FONT, 7)).pack(fill="x", pady=(1, 0))
 
         # View toggles: open lists next to the answer when you want them
         chips = tk.Frame(self.root, bg=BG)
@@ -3089,16 +3085,8 @@ class Overlay:
         title = c["title"] or c["subject"]
         self.title_label.configure(text=title or "Untitled meeting",
                                    fg=FG if title else MUTED, cursor="hand2")
-        self.root.title(f"Sidenote - {title}" if title else "Sidenote")
-        # Only a setup hint under the title, and only while nothing is filled in
-        empty = not any(c[k] for k in ("title", "role", "agenda", "participants", "goals"))
-        if empty:
-            self.info_label.configure(text="Add title, agenda and role", cursor="hand2",
-                                      fg=ACCENT)
-            if not self.info_label.winfo_ismapped():
-                self.info_label.pack(fill="x", pady=(2, 0))
-        elif self.info_label.winfo_ismapped():
-            self.info_label.pack_forget()
+        # Version in the window title is a testing aid (remove before release)
+        self.root.title(f"Sidenote {SIDENOTE_VERSION}" + (f" - {title}" if title else ""))
 
     def open_menu(self, event=None):
         menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=FG, activebackground=ACCENT,
