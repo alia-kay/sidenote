@@ -1,0 +1,23 @@
+# Old copies: Git keeps the history now
+sidenote_backup_*.py
+meeting_copilot.py
+
+# Logs and debug output
+*.log
+mic_debug.txt
+debug_*.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Packaged builds
+*.mcpb
+dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
