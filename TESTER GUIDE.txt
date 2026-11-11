@@ -1,0 +1,103 @@
+SIDENOTE - TESTER GUIDE (Mac)
+Version 2026-11-11 v7
+
+Sidenote is a small window that sits next to your meeting. It reads the
+meeting captions and lets you ask Claude about the meeting while it happens.
+Meeting notes are saved only on your Mac, in Documents/Sidenote.
+
+You need: a Mac with the latest macOS, Google Chrome, the Claude desktop app
+(signed in), an internet connection, and the file
+Sidenote-2026-11-11-v7.mcpb.
+
+
+BEFORE YOU START
+
+1. Nothing else to install. Claude installs everything Sidenote needs
+   (including Python) when you install the extension.
+
+
+INSTALL
+
+2. Double-click Sidenote-2026-11-11-v7.mcpb. Claude opens and shows the
+   Sidenote extension. Click Install.
+   (Or open Claude > Settings > Extensions and drag the file into the window.)
+
+3. If Claude warns that the extension is not from a verified developer,
+   choose to install it anyway. The first install can take 1-2 minutes
+   while Claude downloads what Sidenote needs.
+
+4. Quit Claude completely with Cmd+Q, then open it again.
+
+
+FIRST START
+
+5. Start a normal new chat in Claude and type:
+       open Sidenote
+   If Claude asks for permission to use Sidenote's tools, choose
+   "Always allow".
+
+6. macOS asks for two permissions. Please allow both:
+   a. Reading other apps' windows (needed to read the captions):
+      open System Settings > Privacy & Security > Device Control and Data
+      Access (called "Accessibility" on older macOS) and turn on Claude.
+   b. "Claude would like to access files in your Documents folder":
+      click Allow (meeting notes are saved in Documents/Sidenote).
+
+7. After turning on Claude in step 6a, quit Claude with Cmd+Q, open it
+   again, and type "open Sidenote" in a chat once more. The Sidenote window
+   appears next to your screen.
+
+
+TRY IT IN A GOOGLE MEET CALL
+
+8. Join a Google Meet call in Chrome (a call with a friend or colleague,
+   or a test call on your own) and talk for a few minutes.
+   - Turn on captions in Meet (the CC button). Sidenote tries to turn them
+     on by itself.
+   - Ask Claude something in the box at the bottom of the Sidenote window,
+     for example "What should I ask now?". Your question and Claude's
+     answer appear at the top; older ones are below (scroll down).
+   - Click "What did I miss?".
+   - After about 3 minutes Sidenote should give the meeting a title and
+     1-2 agenda items by itself.
+   - Open the Agenda, Actions and Transcript views with the buttons at
+     the top.
+   - At the end, click "End meeting". Claude writes a short recap.
+
+
+CHECK THE VERSION
+
+9. In the Claude chat, ask:
+       What's Sidenote's status?
+   The answer ends with "Version: 2026-11-11 v7". The Sidenote window title
+   shows the same version.
+
+
+IF THE SIDENOTE WINDOW DOES NOT APPEAR
+
+10. Quit Claude with Cmd+Q. Open Terminal (Applications > Utilities >
+    Terminal), type this line and press Return:
+        pkill -f sidenote.py
+    Then open Claude again and type "open Sidenote" in a chat.
+    If it still does not appear, take a screenshot of the Claude chat and
+    send it to me.
+
+
+UNINSTALL
+
+11. In Claude, open Settings > Extensions, choose Sidenote and uninstall it.
+    If you want, also delete the folder Documents/Sidenote, and turn Claude
+    off again in System Settings > Privacy & Security > Device Control and
+    Data Access.
+
+
+WHAT TO SEND ME
+
+12. Please send back:
+    - Screenshots of the Sidenote window during the meeting (and of any
+      error or warning you saw while installing).
+    - The status line: Claude's answer to "What's Sidenote's status?", and
+      the small line at the bottom of the Sidenote window.
+    - Anything that was confusing, slow or did not work as you expected.
+
+Thank you for testing Sidenote!

@@ -1,0 +1,26 @@
+[project]
+name = "sidenote"
+# Fixed on purpose: the real version is SIDENOTE_VERSION in sidenote.py (the
+# build script puts it in the manifest). Changing this would need a new uv.lock.
+version = "1.0.0"
+description = "Sidenote: a live meeting assistant for the Claude desktop app"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2.3.0",
+    "uiautomation>=2.0.29; sys_platform == 'win32'",
+    "pyobjc-framework-ApplicationServices; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+    # cryptography (needed by mcp) stopped shipping Intel Mac builds in 49.0:
+    # keep Intel Macs on 48.x so they never have to compile it
+    "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+
+[tool.uv]
+# Not a library: just install the dependencies and run sidenote.py
+package = false
+# Always use uv's own Python (it includes tkinter). Never a Python that is
+# already on the computer: Homebrew's often lacks tkinter, macOS's is too old.
+python-preference = "only-managed"
+# Lock only for the platforms Sidenote supports
+environments = ["sys_platform == 'darwin'", "sys_platform == 'win32'"]

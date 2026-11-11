@@ -1,0 +1,54 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
+  "name": "sidenote",
+  "display_name": "Sidenote",
+  "version": "7.0.0",
+  "description": "Live meeting assistant: reads your meeting captions and lets you ask Claude about the meeting while it happens.",
+  "long_description": "Sidenote opens a small window next to your meeting. It reads the captions from Google Meet (with speaker names) or from your computer's Live Captions, keeps a transcript, an agenda, action items and questions to ask, and lets you ask Claude about the meeting at any moment. Meeting files are saved on your computer in Documents/Sidenote. Type 'open Sidenote' in a Claude chat to start.",
+  "author": {
+    "name": "alia-kay"
+  },
+  "icon": "icon.png",
+  "server": {
+    "type": "uv",
+    "entry_point": "sidenote.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--frozen", "--directory", "${__dirname}", "sidenote.py"],
+      "env": {
+        "UV_PYTHON_PREFERENCE": "only-managed"
+      }
+    }
+  },
+  "tools": [
+    {"name": "open_sidenote", "description": "Show the Sidenote window and start reading meeting captions."},
+    {"name": "close_sidenote", "description": "Close the Sidenote window and stop reading captions."},
+    {"name": "wait_for_question", "description": "Live mode: wait for a question typed in the Sidenote window."},
+    {"name": "update_meeting_info", "description": "Save or change the meeting title, agenda, role, goals and participants."},
+    {"name": "add_agenda_items", "description": "Add agenda items without removing existing ones."},
+    {"name": "add_participants", "description": "Add participant names."},
+    {"name": "add_action_item", "description": "Save an action item from the meeting."},
+    {"name": "add_questions_to_ask", "description": "Save questions to ask later in the meeting."},
+    {"name": "mark_done", "description": "Mark an agenda item, action item or question as done."},
+    {"name": "set_context_sources", "description": "Tell Sidenote whether Jira or Confluence tools are available."},
+    {"name": "add_context_item", "description": "Add a Jira ticket or Confluence page related to the meeting."},
+    {"name": "save_recap", "description": "Save the meeting recap into the meeting file."},
+    {"name": "debug_meet_tree", "description": "Troubleshooting: save the structure of the Google Meet window."},
+    {"name": "debug_live_captions_tree", "description": "Troubleshooting: save the structure of the Live Captions window."},
+    {"name": "get_meeting_context", "description": "Return the meeting title, agenda, participants, role and goals."},
+    {"name": "get_recent_transcript", "description": "Return the transcript from the last few minutes."},
+    {"name": "get_full_transcript", "description": "Return the meeting info and the whole transcript."},
+    {"name": "show_suggestion", "description": "Show a short answer in the Sidenote window."},
+    {"name": "start_new_meeting", "description": "Save the current meeting and start a new one."},
+    {"name": "get_status", "description": "Show Sidenote's version, caption connection and where the meeting file is saved."}
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  },
+  "keywords": ["meetings", "captions", "transcript", "google meet", "notes"],
+  "license": "UNLICENSED"
+}
