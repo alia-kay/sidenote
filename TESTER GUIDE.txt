@@ -1,5 +1,5 @@
 SIDENOTE - TESTER GUIDE (Mac)
-Version 2026-11-11 v8
+Version 2026-11-12 v9
 
 Sidenote is a small window that sits next to your meeting. It reads the
 meeting captions and lets you ask Claude about the meeting while it happens.
@@ -7,7 +7,7 @@ Meeting notes are saved only on your Mac, in Documents/Sidenote.
 
 You need: a Mac with the latest macOS, Google Chrome, the Claude desktop app
 (signed in), an internet connection, and the file
-Sidenote-2026-11-11-v8.mcpb.
+Sidenote-2026-11-12-v9.mcpb.
 
 
 BEFORE YOU START
@@ -18,7 +18,7 @@ BEFORE YOU START
 
 INSTALL
 
-2. Double-click Sidenote-2026-11-11-v8.mcpb. Claude opens and shows the
+2. Double-click Sidenote-2026-11-12-v9.mcpb. Claude opens and shows the
    Sidenote extension. Click Install.
    (Or open Claude > Settings > Extensions and drag the file into the window.)
 
@@ -71,12 +71,26 @@ TRY IT IN A GOOGLE MEET CALL
      questions. Open the meeting file (... > Open meetings folder) and
      check whether you could forward it as is.
 
+8b. Your microphone (in Zoom, Teams, or just a YouTube video):
+   - Close the Google Meet tab, then type "open Sidenote" in a new Claude
+     chat. Sidenote uses macOS Live Captions for the other people and your
+     microphone for your own voice.
+   - If macOS asks "Claude would like to access the microphone", click
+     Allow. The first time, the bottom of the Sidenote window says
+     "preparing mic" for a minute or two (one-time download).
+   - Then the bottom line should say "Mac captions + your mic". Talk for a
+     bit and open the Transcript view: your sentences should appear under
+     your name.
+   - If the bottom line says "Mic blocked" or "Mic gives only silence",
+     click it, turn on Claude in the Microphone list, and take a
+     screenshot for me.
+
 
 CHECK THE VERSION
 
 9. In the Claude chat, ask:
        What's Sidenote's status?
-   The answer ends with "Version: 2026-11-11 v8". The Sidenote window title
+   The answer ends with "Version: 2026-11-12 v9". The Sidenote window title
    shows the same version.
 
 

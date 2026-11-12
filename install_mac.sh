@@ -21,7 +21,7 @@ fi
 echo "Using $("$PY" --version) at $PY"
 [ -d "$VENV" ] || "$PY" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-"$VENV/bin/python" -m pip install --quiet mcp pyobjc-framework-ApplicationServices pyobjc-framework-Cocoa pyobjc-framework-Quartz
+"$VENV/bin/python" -m pip install --quiet mcp pyobjc-framework-ApplicationServices pyobjc-framework-Cocoa pyobjc-framework-Quartz pyobjc-framework-AVFoundation sounddevice numpy faster-whisper
 echo "Libraries installed."
 
 "$VENV/bin/python" - "$VENV/bin/python" "$DIR/sidenote.py" <<'PY'

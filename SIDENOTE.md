@@ -23,7 +23,7 @@ How it works: Sidenote is a local MCP server for the Claude desktop app, on Wind
 - Google Meet captions in Chrome or Edge, with speaker names (Windows and Mac). This is the preferred source.
 - Sidenote turns on Meet captions by itself. It presses the CC button and the "Turn on captions" item in its menu, without moving the mouse or pressing keys. It tries at most 2 times per meeting. If you turn captions off on purpose, it leaves them off.
 - Windows Live Captions as a fallback, for Zoom, Teams, videos and any other app. It can include your own microphone.
-- macOS Live Captions as a fallback on Mac. Sidenote turns it on by itself, hides its window, and switches it off when Sidenote closes. On Mac it hears the other people but not your own microphone (own-mic transcription is paused for now).
+- macOS Live Captions as a fallback on Mac. Sidenote turns it on by itself, hides its window, and switches it off when Sidenote closes. It hears the other people; the user's own voice comes from the microphone, transcribed on the Mac with Whisper (through Claude's microphone permission; Sidenote asks macOS for it, and says so in the footer if access is blocked or the mic gives only silence).
 - If Meet captions are lost, Sidenote switches to Live Captions automatically.
 
 ## The Sidenote window
@@ -89,7 +89,7 @@ open_sidenote, close_sidenote, wait_for_question, show_suggestion, update_meetin
 
 ## Still open
 
-- Own-microphone transcription on Mac needs a separate helper app (paused).
+- Own-microphone transcription on Mac is back (v9), not yet confirmed on a real Mac. If macOS still gives only silence with permission granted, the fallback is a separate helper app with its own mic permission.
 - Old Sidenote processes on Mac can survive quitting Claude and need sudo pkill. Sidenote should exit when Claude disconnects.
 - Live Captions was "not found" on the very first Mac try. Keep an eye on it.
 - The Mac + Windows merged version hasn't been tested in a real meeting yet.

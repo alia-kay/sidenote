@@ -49,9 +49,9 @@ log = logging.getLogger("sidenote")
 
 POLL_SECONDS = 0.5
 SAVE_DIR = os.path.join(os.path.expanduser("~"), "Documents", "Sidenote")
-# Own-mic transcription on Mac is paused: macOS gives a process launched by
-# Claude only silence. Needs a separate helper app with mic permission.
-MAC_MIC_ENABLED = False
+# Own-mic transcription on Mac (when the source is macOS Live Captions, which
+# hears the others but not the user). Uses Claude's microphone permission.
+MAC_MIC_ENABLED = True
 CAPTIONS_WINDOW_CLASS = "LiveCaptionsDesktopWindow"
 CAPTIONS_TEXT_ID = "CaptionsTextBlock"
 WAIT_DEFAULT_SECONDS = 50       # how long one wait_for_question call listens
@@ -1535,7 +1535,7 @@ def meet_key(title):
     return m.group(0) if m else (title or "").lower()
 
 
-SIDENOTE_VERSION = "2026-11-11 v8"
+SIDENOTE_VERSION = "2026-11-12 v9"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -1993,90 +1993,140 @@ class MacMeetReader:
 
 
 class MicTranscriber:
-    """Mac fallback: transcribes your own microphone on the computer (Whisper),
-    because macOS Live Captions listens to one source at a time. Lines are saved
-    as 'You: ...'. Needs: pip install faster-whisper sounddevice numpy."""
+    """Mac: transcribes the user's own microphone on the computer (Whisper), while
+    macOS Live Captions hears the other people (it listens to one source at a
+    time). Lines are saved as 'You: ...' (shown with the user's name).
+
+    The mic is reached through Claude's microphone permission (Sidenote runs
+    inside Claude). Sidenote asks macOS for it first, so the user gets the normal
+    "Claude would like to access the microphone" prompt; without asking, macOS
+    only hands over silence. If audio is still pure silence, the footer says so.
+
+    status: off, asking, blocked, loading, on, silent, missing, error."""
     MODEL = "base"            # multilingual, ~145 MB, downloaded once
-    LANGUAGE = "en"           # language you speak in meetings (None = detect)
     RATE = 16000
+    SILENT_SECONDS = 4        # this long of exact zeros = macOS gives us silence
+    LOCK_LANGUAGE_PROB = 0.8  # detected this surely -> keep that language
 
     def __init__(self):
         self.thread = None
         self.running = threading.Event()
         self.status = "off"
         self.model = None
+        self.language = None  # detected, then kept for the rest of the session
+        self.detail = ""      # last error, for the logs and get_status
 
     def available(self):
         try:
             import faster_whisper, sounddevice, numpy  # noqa: F401
             return True
-        except Exception:
+        except Exception as e:
+            self.detail = f"packages missing: {e}"
             return False
-
-    def _dbg(self, msg):
-        try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mic_debug.txt"), "a") as f:
-                f.write(time.strftime("%H:%M:%S ") + msg + "\n")
-        except Exception:
-            pass
 
     def start(self):
         if self.running.is_set():
             return
-        self._dbg("start requested")
         if not self.available():
             self.status = "missing"
-            self._dbg("packages missing")
+            log.info("Microphone: %s", self.detail)
             return
         self.running.set()
+        self.language = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def stop(self):
         self.running.clear()
-        self.status = "off"
+        if self.status not in ("blocked", "silent", "missing", "error"):
+            self.status = "off"
 
+    # --- permission -------------------------------------------------------------
+    def permission(self, ask=True, timeout=60):
+        """'granted', 'denied', 'restricted' or 'unknown'. Asks macOS once when it
+        has never been asked (the prompt names Claude, which runs Sidenote)."""
+        try:
+            from AVFoundation import AVCaptureDevice, AVMediaTypeAudio
+        except Exception as e:
+            log.info("Microphone: AVFoundation unavailable (%s)", e)
+            return "unknown"
+        names = {0: "not_determined", 1: "restricted", 2: "denied", 3: "granted"}
+        state = names.get(int(AVCaptureDevice.authorizationStatusForMediaType_(AVMediaTypeAudio)),
+                          "unknown")
+        log.info("Microphone permission: %s", state)
+        if state != "not_determined" or not ask:
+            return state
+        self.status = "asking"
+        answered, result = threading.Event(), {}
+
+        def done(granted):
+            result["granted"] = bool(granted)
+            answered.set()
+        AVCaptureDevice.requestAccessForMediaType_completionHandler_(AVMediaTypeAudio, done)
+        answered.wait(timeout)
+        state = "granted" if result.get("granted") else (
+            "denied" if answered.is_set() else "not_determined")
+        log.info("Microphone permission after asking: %s", state)
+        return state
+
+    # --- transcription ----------------------------------------------------------
     def _load(self):
         if self.model is None:
             self.status = "loading"
-            ui_queue.put(("toast", "Preparing microphone transcription (one-time download)\u2026"))
+            ui_queue.put(("toast", "Preparing microphone transcription (one-time download)…"))
             from faster_whisper import WhisperModel
             self.model = WhisperModel(self.MODEL, device="cpu", compute_type="int8")
         return self.model
 
     def _transcribe(self, audio):
-        segments, _ = self._load().transcribe(
-            audio, language=self.LANGUAGE, beam_size=1, vad_filter=False,
+        segments, info = self._load().transcribe(
+            audio, language=self.language, beam_size=1, vad_filter=False,
             condition_on_previous_text=False)
         words = []
         for seg in segments:
             if seg.no_speech_prob > 0.6 or seg.avg_logprob < -1.0:
                 continue
             words.append(seg.text.strip())
-        return " ".join(w for w in words if w)
+        text = " ".join(w for w in words if w)
+        # Auto-detect the language, then keep it once Whisper is sure: short
+        # phrases are often mis-detected on their own.
+        if self.language is None and text and \
+                getattr(info, "language_probability", 0) >= self.LOCK_LANGUAGE_PROB:
+            self.language = info.language
+            log.info("Microphone language: %s", self.language)
+        return text
 
     def _run(self):
+        state = self.permission()
+        if state != "granted" and state != "unknown":
+            self.status = "blocked"
+            self.detail = f"permission {state}"
+            ui_queue.put(("toast", "Microphone blocked: allow Claude in Privacy & Security "
+                                   "> Microphone"))
+            self.running.clear()
+            return
         import numpy as np
         import sounddevice as sd
         blocks = queue.Queue()
         try:
             self._load()
-            self._dbg("model loaded; default input: %s" % (sd.query_devices(kind="input") or {}).get("name"))
+            device = (sd.query_devices(kind="input") or {}).get("name")
+            log.info("Microphone: model ready, input device %r", device)
             stream = sd.InputStream(samplerate=self.RATE, channels=1, dtype="float32",
                                     blocksize=int(self.RATE * 0.1),
                                     callback=lambda data, frames, t, st: blocks.put(data.copy()))
             stream.start()
         except Exception as e:
             log.info("Microphone transcription unavailable: %s", e)
-            self._dbg("ERROR: %r" % e)
+            self.detail = str(e)[:200]
             ui_queue.put(("toast", "Mic didn't start: " + str(e)[:120]))
             self.status = "error"
             self.running.clear()
             return
         self.status = "on"
         log.info("Microphone transcription started")
-        self._dbg("stream started")
-        peak, peak_t = 0.0, time.time()
+        peak, peak_t, started = 0.0, time.time(), time.time()
+        any_signal = False
         noise, speech, silence, heard = 0.004, [], 0.0, 0.0
         try:
             while self.running.is_set():
@@ -2084,17 +2134,27 @@ class MicTranscriber:
                     block = blocks.get(timeout=0.5)
                 except queue.Empty:
                     continue
+                if not any_signal:
+                    any_signal = bool(np.any(block))
+                    if not any_signal and time.time() - started >= self.SILENT_SECONDS:
+                        # exact zeros: macOS is withholding the microphone
+                        self.status = "silent"
+                        self.detail = "microphone delivers only silence"
+                        log.info("Microphone: only silence (all zeros) after %ss",
+                                 self.SILENT_SECONDS)
+                        ui_queue.put(("toast", "The microphone gives Sidenote only silence"))
+                        break
                 level = float(np.sqrt(np.mean(block ** 2)))
                 peak = max(peak, level)
-                if time.time() - peak_t >= 5:
-                    self._dbg("peak level last 5s: %.4f" % peak)
+                if time.time() - peak_t >= 30:
+                    log.info("Microphone: peak level last 30 s %.4f", peak)
                     peak, peak_t = 0.0, time.time()
                 talking = level > max(0.012, noise * 3.0)
                 if not talking and not speech:
                     noise = 0.95 * noise + 0.05 * level          # follow the room noise
                 if talking:
                     speech.append(block); silence = 0.0; heard += 0.1
-                    transcript.pending = "You: \u2026"
+                    transcript.pending = "You: …"
                 elif speech:
                     speech.append(block); silence += 0.1
                 long_enough = len(speech) * 0.1 >= 12
@@ -2108,18 +2168,45 @@ class MicTranscriber:
                         except Exception as e:
                             log.info("Transcription error: %s", e)
                     speech, silence, heard = [], 0.0, 0.0
-                    if transcript.pending == "You: \u2026":
+                    if transcript.pending == "You: …":
                         transcript.pending = ""
         finally:
             try:
                 stream.stop(); stream.close()
             except Exception:
                 pass
-            self.status = "off"
-            log.info("Microphone transcription stopped")
+            if self.status == "on":
+                self.status = "off"
+            self.running.clear()
+            log.info("Microphone transcription stopped (%s)", self.status)
 
 
 mic = MicTranscriber()
+MIC_NEEDS_USER = ("blocked", "silent", "missing", "error")   # don't retry these by itself
+
+
+def update_mic(on_live_captions):
+    """Mic on while Sidenote is open, a meeting is running and the source is Live
+    Captions (Meet's captions already include the user). After 'blocked',
+    'silent', 'missing' or 'error' it waits for the user (click in the footer)."""
+    want = window_open.is_set() and on_live_captions and not transcript.ended_at
+    if want and not mic.running.is_set() and mic.status not in MIC_NEEDS_USER:
+        mic.start()
+    elif not want and mic.running.is_set():
+        mic.stop()
+
+
+def retry_mic():
+    """Footer click: open the Microphone privacy page if access is blocked,
+    then let update_mic try again."""
+    if mic.status in ("blocked", "silent") and IS_MAC:
+        try:
+            import subprocess
+            subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference."
+                                      "security?Privacy_Microphone"])
+        except Exception as e:
+            log.info("Could not open Privacy settings: %s", e)
+    mic.status = "off"
 
 
 def captions_loop():
@@ -2134,12 +2221,7 @@ def captions_loop():
         meet_lost_since = None
         while True:
             if IS_MAC and MAC_MIC_ENABLED:
-                want_mic = window_open.is_set() and active is not None and active is not meet \
-                    and not transcript.ended_at
-                if want_mic and not mic.running.is_set():
-                    mic.start()
-                elif not want_mic and mic.running.is_set():
-                    mic.stop()
+                update_mic(active is not None and active is not meet)
             if not window_open.is_set():
                 meet.reset(); windows.reset()
                 meet.auto.clear()
@@ -2830,6 +2912,7 @@ def core_get_status():
             f"{auto_cc_status['text'] + '. ' if auto_cc_status['text'] else ''}"
             f"{f'{transcript.replay_skipped} replayed caption lines skipped. ' if transcript.replay_skipped else ''}"
             f"User: {profile.name or '(name not set)'}. "
+            f"{f'Mic: {mic.status}' + (f' ({mic.detail})' if mic.detail else '') + '. ' if IS_MAC else ''}"
             f"Version: {SIDENOTE_VERSION}")
 
 
@@ -3275,6 +3358,7 @@ class Overlay:
         self.state_label.pack(side="left", padx=(4, 0))
         self.right_label = tk.Label(footer, text="", bg=BG, fg=FAINT, font=(FONT, 8), anchor="e")
         self.right_label.pack(side="right")
+        self.right_label.bind("<Button-1>", lambda e: self._footer_click())
         self.footer = footer
         self.caption_dot = tk.Label(footer, text="●", bg=BG, fg=FAINT, font=(FONT, 8))
         self.caption_dot.pack(side="right", padx=(0, 4))
@@ -4011,6 +4095,14 @@ class Overlay:
             return "Claude paused \u00b7 type 'continue' in the Claude app", WARN
         return "Claude not connected · type 'continue' in the Claude app", FAINT
 
+    def _mic_fixable(self):
+        return IS_MAC and mic.status in MIC_NEEDS_USER and transcript.source != "Google Meet"
+
+    def _footer_click(self):
+        if self._mic_fixable():
+            retry_mic()
+            self.toast("Trying the microphone again…")
+
     def _captions_state(self):
         """Footer, right side: which transcript source is active and its health."""
         status, source = transcript.status, transcript.source
@@ -4026,10 +4118,16 @@ class Overlay:
                 label += " + your mic"
             elif mic.status == "loading":
                 label += " \u00b7 preparing mic"
+            elif mic.status == "asking":
+                label += " \u00b7 allow the microphone for Claude"
+            elif mic.status == "blocked":
+                return "Mic blocked \u00b7 click to allow Claude in Microphone settings", WARN
+            elif mic.status == "silent":
+                return "Mic gives only silence \u00b7 click to check Microphone settings", WARN
             elif mic.status == "missing":
-                label += " \u00b7 mic needs setup"
+                label += " \u00b7 mic not installed"
             elif mic.status == "error":
-                label += " \u00b7 mic blocked (Settings > Privacy > Microphone)"
+                return "Mic didn't start \u00b7 click to try again", WARN
         if status.startswith("Live Captions connected"):
             return label, OK
         if "waiting for speech" in status:
@@ -4089,7 +4187,8 @@ class Overlay:
         _, minutes = transcript.stats()
         self.caption_dot.configure(fg=ccolor)
         self.right_label.configure(text=f"{ctext}  ·  {minutes} min",
-                                   fg=WARN if ccolor == WARN else FAINT)
+                                   fg=WARN if ccolor == WARN else FAINT,
+                                   cursor="hand2" if self._mic_fixable() else "")
 
         if transcript.ended_at or "transcript" in self.visible:
             self.tail.configure(text="")

@@ -38,8 +38,14 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
      don't come on within a few seconds, press CC yourself. If you turn
      captions off during the call, Sidenote leaves them off.
    - Other apps (Zoom, Teams, videos): Sidenote turns on macOS Live Captions by
-     itself and hides its window. Note: this hears the other people, not your
-     own microphone.
+     itself and hides its window. Live Captions hears the other people; your
+     own voice comes from your microphone, transcribed on your Mac.
+     The first time, macOS asks "Claude would like to access the microphone":
+     click Allow. Then Sidenote downloads its speech model once (about 150 MB;
+     the bottom of the window says "preparing mic"). If the bottom line says
+     "Mic blocked" or "Mic gives only silence", click it: it opens
+     Privacy & Security > Microphone, where Claude must be turned on.
+     Apple silicon Macs need macOS 14 or newer for this.
    Type a question in the Sidenote window and press Ask.
    If the status stays on "Connecting to Claude", type continue in the Claude chat.
    Close the Sidenote window to end the meeting. Meeting notes are saved in

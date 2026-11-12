@@ -1,6 +1,6 @@
 # Old copies: Git keeps the history now
 sidenote_backup_*.py
-meeting_copilot.py
+meeting_*.py
 
 # Logs and debug output
 *.log

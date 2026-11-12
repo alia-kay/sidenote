@@ -4,16 +4,23 @@ name = "sidenote"
 # build script puts it in the manifest). Changing this would need a new uv.lock.
 version = "1.0.0"
 description = "Sidenote: a live meeting assistant for the Claude desktop app"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"   # the extension runs 3.13 (.python-version)
 dependencies = [
     "mcp>=2.3.0",
     "uiautomation>=2.0.29; sys_platform == 'win32'",
     "pyobjc-framework-ApplicationServices; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+    # Mac microphone: permission (AVFoundation), capture and on-device Whisper
+    "pyobjc-framework-AVFoundation; sys_platform == 'darwin'",
+    "sounddevice; sys_platform == 'darwin'",
+    "numpy; sys_platform == 'darwin'",
+    "faster-whisper; sys_platform == 'darwin'",
     # cryptography (needed by mcp) stopped shipping Intel Mac builds in 49.0:
     # keep Intel Macs on 48.x so they never have to compile it
     "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    # onnxruntime (needed by faster-whisper) dropped Intel Macs after 1.23
+    "onnxruntime<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 
 [tool.uv]
