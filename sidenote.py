@@ -55,6 +55,8 @@ MAC_MIC_ENABLED = True
 CAPTIONS_WINDOW_CLASS = "LiveCaptionsDesktopWindow"
 CAPTIONS_TEXT_ID = "CaptionsTextBlock"
 WAIT_DEFAULT_SECONDS = 50       # how long one wait_for_question call listens
+HISTORY_WAIT_SECONDS = 240      # ...on the Home/History screens (cheaper for Claude)
+HISTORY_IDLE_SECONDS = 15 * 60  # no question this long on Home/History -> IDLE
 ENDED_GRACE_SECONDS = 15 * 60  # after End meeting, stay ready this long for a new one
 CUE_DELAY_SECONDS = 4          # wait this long after a cue phrase (sentence may continue)
 MIN_SCAN_GAP_SECONDS = 30      # at most one scan every 30 s
@@ -113,13 +115,18 @@ def safe_filename(text):
     return re.sub(r"\s+", " ", text)[:80]
 
 
-def parse_list(value):
-    """Accept a list, or text with one item per line / separated by ; or commas."""
+def parse_list(value, commas=True):
+    """Accept a list, or text with one item per line / separated by ; or commas.
+    commas=False (agenda items): split only on new lines and semicolons, so
+    'vision, strategy, design' stays one item."""
     if isinstance(value, (list, tuple)):
         items = value
     else:
         text = str(value or "")
-        items = re.split(r"\n|;", text) if ("\n" in text or ";" in text) else text.split(",")
+        if "\n" in text or ";" in text or not commas:
+            items = re.split(r"\n|;", text)
+        else:
+            items = text.split(",")
     out = []
     for item in items:
         item = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s*", "", str(item)).strip()
@@ -440,6 +447,8 @@ class Transcript:
         self.last_final = None            # last sentence committed (raw)
         self.pending = ""                 # sentence still being spoken
         self.started = datetime.datetime.now()
+        self.meeting_id = new_meeting_id(self.started)
+        self.item_status = {}             # open question id -> status (answered/open)
         self.file_path = None             # chosen on first save
         self.dirty = False
 
@@ -471,9 +480,9 @@ class Transcript:
                 profile.set_role(role)        # remembered for the next meetings
             if participants is not None and parse_list(participants):
                 c["participants"] = parse_list(participants)
-            if agenda is not None and parse_list(agenda):
-                c["agenda"] = parse_list(agenda)
-            if (title and str(title).strip()) or (agenda and parse_list(agenda)):
+            if agenda is not None and parse_list(agenda, commas=False):
+                c["agenda"] = parse_list(agenda, commas=False)
+            if (title and str(title).strip()) or (agenda and parse_list(agenda, commas=False)):
                 self.context_dirty = True
         self.save_now()
 
@@ -481,7 +490,7 @@ class Transcript:
         """Add agenda topics, skipping anything already on the agenda (even reworded)."""
         added = []
         with self.lock:
-            for item in parse_list(items):
+            for item in parse_list(items, commas=False):
                 if not any(_same(item, a) for a in self.context["agenda"]):
                     self.context["agenda"].append(item)
                     added.append(item)
@@ -510,6 +519,7 @@ class Transcript:
         if not owner:
             owner, sure = self.guess_owner(text)
         due = real_dates(due.strip(), self.started, due=True)
+        when, _ = self._best_match(text)          # takes the lock itself: call it before
         with self.lock:
             for a in self.context["actions"]:
                 if _same(a["text"], text):
@@ -519,8 +529,11 @@ class Transcript:
                         a["due"] = due
                     self.dirty = True
                     return False
-            self.context["actions"].append({"text": text, "owner": owner, "sure": sure,
-                                            "due": due, "done": False})
+            self.context["actions"].append({
+                "id": f"a{len(self.context['actions']) + 1}", "text": text, "owner": owner,
+                "sure": sure, "due": due, "done": False, "created_in": self.meeting_id,
+                "source_time": (when or datetime.datetime.now()).strftime("%H:%M:%S"),
+                "closed_at": "", "closed_by": "", "close_evidence": ""})
             self.dirty = True
         return True
 
@@ -561,28 +574,20 @@ class Transcript:
         """Find who owns a task from the transcript, in this order: the speaker
         who committed ('I'll do X'), the person addressed ('Leon, can you...'),
         a known person named in that line (unsure). Returns (owner, sure)."""
-        words = {w for w in re.findall(r"[a-z0-9']+", task.lower())
-                 if len(w) > 2 and w not in OWNER_STOPWORDS}
-        if not words:
-            return "", True
-        with self.lock:
-            lines = [s for _, s in self.entries[-80:] if not s.startswith(NOTE_PREFIXES)]
-            people = [p for p in self.people()]
-        best, best_score = None, 0
-        for line in lines:                       # latest best match wins
-            spoken = set(re.findall(r"[a-z0-9']+", line.lower()))
-            score = len(words & spoken)
-            if score >= min(2, len(words)) and score >= best_score:
-                best, best_score = line, score
+        _, best = self._best_match(task)
         if not best:
             return "", True
+        with self.lock:
+            people = [p for p in self.people()]
         speaker, sep, said = best.partition(": ")
         if not sep or len(speaker) > 40:
             speaker, said = "", best
         speaker = speaker_name(speaker)
         m = ADDRESSED.search(said) or ADDRESSED_END.search(said)
         if m and m.group(1).lower() not in OWNER_STOPWORDS:
-            return m.group(1), True
+            name = m.group(1)                  # 'Dana' -> 'Dana Lee' when we know her
+            full = [p for p in people if p.split()[0].lower() == name.lower()]
+            return (full[0] if len(full) == 1 else name), True
         if COMMITMENT.search(said) and speaker and speaker != "Others":
             return normalize_owner(speaker if speaker not in ("You", "Me") else "me"), True
         for person in people:
@@ -591,6 +596,22 @@ class Transcript:
                 return person, False
         return "", True
 
+    def _best_match(self, task):
+        """(time, line) of the transcript line that best matches a task, or (None, None)."""
+        words = {w for w in re.findall(r"[a-z0-9']+", task.lower())
+                 if len(w) > 2 and w not in OWNER_STOPWORDS}
+        if not words:
+            return None, None
+        with self.lock:
+            lines = [(t, s) for t, s in self.entries[-80:] if not s.startswith(NOTE_PREFIXES)]
+        best, best_score = (None, None), 0
+        for t, line in lines:                    # latest best match wins
+            spoken = set(re.findall(r"[a-z0-9']+", line.lower()))
+            score = len(words & spoken)
+            if score >= min(2, len(words)) and score >= best_score:
+                best, best_score = (t, line), score
+        return best
+
     def add_question(self, text):
         text = text.strip()
         if not text:
@@ -598,7 +619,8 @@ class Transcript:
         with self.lock:
             if any(_same(q["text"], text) for q in self.context["questions"]):
                 return False
-            self.context["questions"].append({"text": text, "done": False})
+            self.context["questions"].append(
+                {"id": f"t{len(self.context['questions']) + 1}", "text": text, "done": False})
             self.dirty = True
         return True
 
@@ -618,9 +640,40 @@ class Transcript:
             items = self.context[kind]
             if 0 <= index < len(items):
                 items[index]["done"] = done
+                if kind == "actions":                 # ticked by the user in the window
+                    items[index].update(
+                        closed_at=datetime.datetime.now().isoformat(timespec="seconds")
+                        if done else "", closed_by="user" if done else "", close_evidence="")
                 self.dirty = True
                 return True
         return False
+
+    def update_item(self, kind, item_id, status, by, evidence=""):
+        """update_item for the meeting being recorded (kept in memory, then saved)."""
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        with self.lock:
+            if kind == "action":
+                for a in self.context["actions"]:
+                    if a.get("id") == item_id:
+                        a["done"] = status == "done"
+                        a.update(closed_at=now if a["done"] else "",
+                                 closed_by=by if a["done"] else "",
+                                 close_evidence=evidence if a["done"] and by == "claude" else "")
+                        self.dirty = True
+                        return a["text"]
+                return None
+            for q in self.context["questions"]:
+                if q.get("id") == item_id:
+                    q["done"] = status == "answered"
+                    self.dirty = True
+                    return q["text"]
+            lines = [l for l in self.context["open_debates"].splitlines() if l.strip()]
+            for i, line in enumerate(lines, 1):
+                if f"q{i}" == item_id:
+                    self.item_status[item_id] = status
+                    self.dirty = True
+                    return re.sub(r"^\s*-\s*", "", line).strip()
+        return None
 
     def add_context(self, title, source="", detail="", url=""):
         """Returns 'added', 'updated' (already listed, by title or link),
@@ -943,6 +996,61 @@ class Transcript:
                   if not s.startswith(("YOU ASKED:", "CLAUDE:"))]
         return "\n".join(lines) + "\n"
 
+    def to_json(self):
+        """The meeting as structured data (meeting.json), schema SCHEMA_VERSION."""
+        c = self.context
+        end = self.ended_at or datetime.datetime.now()
+        day = self.started.date()
+
+        def rows(text):
+            return [re.sub(r"^\s*[-*\u2022]\s*", "", l).strip()
+                    for l in (text or "").splitlines() if l.strip()]
+        by_person = []
+        for line in rows(c["by_person"]):
+            who, sep, said = line.partition(":")
+            by_person.append({"name": who.strip(), "text": said.strip()}
+                             if sep and len(who) <= 60 else {"name": "", "text": line})
+        spoken = []
+        for t, line in self.entries:
+            if line.startswith(NOTE_PREFIXES):
+                continue
+            line = display_line(line)
+            who, sep, said = line.partition(": ")
+            spoken.append({"t": t.strftime("%H:%M:%S"), "speaker": who if sep and len(who) <= 40
+                           else "", "text": said if sep and len(who) <= 40 else line})
+        actions = []
+        for a in c["actions"]:
+            actions.append({
+                "id": a.get("id", ""), "text": real_dates(a["text"], day),
+                "owner": owner_text(a["owner"]), "owner_sure": a.get("sure", True),
+                "due": a["due"], "status": "done" if a["done"] else "open",
+                "created_in": a.get("created_in", self.meeting_id),
+                "source_time": a.get("source_time", ""), "closed_at": a.get("closed_at", ""),
+                "closed_by": a.get("closed_by", ""), "close_evidence": a.get("close_evidence", "")})
+        return {
+            "schema_version": SCHEMA_VERSION, "id": self.meeting_id, "imported": False,
+            "app": f"Sidenote {SIDENOTE_VERSION}",
+            "title": c["title"] or c["subject"], "subject": c["subject"],
+            "date": day.isoformat(), "start": self.started.strftime("%H:%M"),
+            "end": end.strftime("%H:%M"),
+            "duration_min": int((end - self.started).total_seconds() // 60),
+            "ended": bool(self.ended_at), "user_name": profile.name,
+            "participants": self.people(), "role": c["role"], "goals": c["goals"],
+            "agenda": [{"text": a, "covered": a in c["agenda_done"]} for a in c["agenda"]],
+            "summary": real_dates(c["recap"], day), "by_person": by_person,
+            "decisions": [{"id": f"d{i}", "text": real_dates(x, day)}
+                          for i, x in enumerate(rows(c["decisions"]), 1)],
+            "open_questions": [{"id": f"q{i}", "text": real_dates(x, day),
+                                "status": self.item_status.get(f"q{i}", "open")}
+                               for i, x in enumerate(rows(c["open_debates"]), 1)],
+            "action_items": actions,
+            "questions_to_ask": [{"id": q.get("id", f"t{i}"), "text": q["text"], "asked": q["done"]}
+                                 for i, q in enumerate(c["questions"], 1)],
+            "context": [dict(x) for x in c["context"]],
+            "transcript": spoken,
+            "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+
     def save_now(self):
         with self.lock:
             has_content = self.entries or any(
@@ -955,6 +1063,10 @@ class Transcript:
                 target = self._target_path()
                 if self.file_path and self.file_path != target and os.path.exists(self.file_path):
                     os.replace(self.file_path, target)    # title changed: rename the file
+                    old_json = json_path_for(self.file_path)
+                    if os.path.exists(old_json):
+                        os.replace(old_json, json_path_for(target))
+                _write_json(json_path_for(target), self.to_json())    # json first (see import)
                 tmp = target + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
                     f.write(self._render())
@@ -1071,6 +1183,376 @@ class Transcript:
         )
 
 
+# ---------------------------------------------------------------------------
+# Meeting history: one <name>.meeting.json next to each <name>.txt
+# ---------------------------------------------------------------------------
+# The json holds everything (recap, lists, transcript), so each meeting is one
+# self-contained file to back up or move. A small cache (.sidenote_index.json)
+# keeps titles, summaries and items for fast queries; it is rebuilt from the
+# meeting files whenever they change, so it is safe to delete.
+SCHEMA_VERSION = 1
+MEETING_EXT = ".meeting.json"
+INDEX_NAME = ".sidenote_index.json"
+_history_lock = threading.RLock()
+
+
+def new_meeting_id(started):
+    return f"{started:%Y%m%d-%H%M}-{os.urandom(2).hex()}"
+
+
+def json_path_for(txt_path):
+    base = txt_path[:-4] if txt_path.lower().endswith(".txt") else txt_path
+    return base + MEETING_EXT
+
+
+def _write_json(path, data):
+    import json
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def migrate_meeting(data):
+    """Bring a meeting.json from any Sidenote version to the current schema.
+    Version 1 is the first one; later versions add steps here. Missing fields
+    get defaults, so older or imported files never break a query."""
+    version = int(data.get("schema_version") or 0)
+    if version > SCHEMA_VERSION:
+        log.info("Meeting %s is from a newer Sidenote (schema %s)", data.get("id"), version)
+    defaults = {"id": "", "imported": False, "title": "", "subject": "", "date": "",
+                "start": "", "end": "", "duration_min": None, "participants": [],
+                "agenda": [], "summary": "", "by_person": [], "decisions": [],
+                "open_questions": [], "action_items": [], "questions_to_ask": [],
+                "context": [], "transcript": [], "user_name": "", "role": "", "goals": ""}
+    for key, value in defaults.items():
+        if data.get(key) is None:
+            data[key] = value if not isinstance(value, list) else []
+    data["schema_version"] = max(version, SCHEMA_VERSION) if version else SCHEMA_VERSION
+    return data
+
+
+def load_meeting(path):
+    import json
+    with open(path, encoding="utf-8") as f:
+        data = migrate_meeting(json.load(f))
+    data["_path"] = path
+    return data
+
+
+# ---- import of meetings saved before meeting.json existed ------------------------
+_IMPORT_HEADERS_V6 = {"AGENDA", "PARTICIPANTS", "MY ROLE", "MY GOALS", "QUICK RECAP",
+                      "ACTION ITEMS", "CONTEXT (Jira / Confluence)", "QUESTIONS TO ASK",
+                      "FULL TRANSCRIPT"}
+_IMPORT_HEADERS_V8 = {"SUMMARY", "BY PERSON", "DECISIONS", "ACTION ITEMS", "OPEN QUESTIONS",
+                      "CONTEXT", "TRANSCRIPT"}
+_LINE = re.compile(r"^\[(\d{2}:\d{2}:\d{2})\] (.*)$")
+_SPEAKER = re.compile(r"^([A-ZЀ-Я][\w.'\-]*(?: [A-ZЀ-Я][\w.'\-]*){0,3}): (.+)$")
+
+
+def _split_speaker(line):
+    m = _SPEAKER.match(line)
+    if m and m.group(1) not in ("YOU ASKED", "CLAUDE"):
+        return m.group(1), m.group(2)
+    return "", line
+
+
+def parse_meeting_txt(path):
+    """Best-effort reading of a saved meeting .txt (all three layouts Sidenote has
+    used). Returns a meeting dict marked imported, or None if it isn't a meeting."""
+    import hashlib
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    lines = text.splitlines()
+    name = os.path.basename(path)
+    if not lines:
+        return None
+    structured = lines[0].startswith("MEETING:")
+    if not structured and not any(_LINE.match(l) for l in lines[:20]):
+        return None                              # not a meeting (debug or capture file)
+    d = migrate_meeting({"imported": True, "source_txt": name})
+    m = re.search(r"(\d{4}-\d{2}-\d{2})(?:_(\d{2})(\d{2}))?", name)
+    day = m.group(1) if m else ""
+    start = f"{m.group(2)}:{m.group(3)}" if m and m.group(2) else ""
+    end = ""
+    sections, current = {}, None
+    headers = _IMPORT_HEADERS_V6 | _IMPORT_HEADERS_V8
+    for line in lines:
+        if line.strip() in headers:
+            current = line.strip()
+            sections[current] = []
+            continue
+        if current is None:
+            if line.startswith("MEETING:"):
+                d["title"] = line[8:].strip()
+            elif line.startswith("Subject:"):
+                d["subject"] = line[8:].strip()
+            elif line.startswith("Date:"):
+                dm = re.search(r"(\d{4}-\d{2}-\d{2})", line)
+                if dm:
+                    day = dm.group(1)
+                else:
+                    dm = re.search(r"(\d{1,2}) (\w{3}) (\d{4})", line)
+                    if dm:
+                        try:
+                            day = datetime.datetime.strptime(" ".join(dm.groups()),
+                                                             "%d %b %Y").date().isoformat()
+                        except ValueError:
+                            pass
+                times = re.findall(r"(\d{2}:\d{2})", line)
+                if times:
+                    start, end = times[0], times[-1]
+            elif line.startswith("Participants:"):
+                d["participants"] = parse_list(line[13:])
+            elif re.match(r"^- \[[ x]\] ", line):
+                d["agenda"].append({"text": line[6:].strip(), "covered": line[3] == "x"})
+            elif re.match(r"^(?:.+'s|My) role: ", line):
+                d["role"] = line.split(": ", 1)[1].strip()
+            elif re.match(r"^(?:.+'s|My) goals: ", line):
+                d["goals"] = line.split(": ", 1)[1].strip()
+            elif _LINE.match(line):
+                current = "TRANSCRIPT"
+                sections[current] = [line]
+            continue
+        sections[current].append(line)
+
+    def body(*keys):
+        for k in keys:
+            if k in sections:
+                return [l for l in sections[k] if l.strip()]
+        return []
+
+    def bullets(rows):
+        return [re.sub(r"^\s*[-*•]\s*", "", r).strip() for r in rows]
+
+    v8 = "SUMMARY" in sections or "BY PERSON" in sections      # owner in brackets
+    if "AGENDA" in sections:
+        for row in body("AGENDA"):
+            am = re.match(r"^- (?:\[([ x])\] )?(.*)$", row)       # oldest files: '- item'
+            if am and am.group(2).strip():
+                d["agenda"].append({"text": am.group(2).strip(), "covered": am.group(1) == "x"})
+    if not d["participants"]:
+        d["participants"] = bullets(body("PARTICIPANTS"))
+    if body("MY ROLE"):
+        d["role"] = " ".join(body("MY ROLE"))
+    if body("MY GOALS"):
+        d["goals"] = " ".join(body("MY GOALS"))
+    decisions, open_qs = bullets(body("DECISIONS")), []
+    recap = body("QUICK RECAP")
+    if recap:                                     # v6: 'Summary: ... / Decisions: ...'
+        summary = []
+        for row in recap:
+            label, sep, rest = row.partition(":")
+            key = label.strip().lower()
+            if sep and key == "summary":
+                summary.append(rest.strip())
+            elif sep and key == "decisions":
+                if rest.strip().lower().rstrip(".") not in ("none", "none yet", "no"):
+                    decisions += [x.strip() for x in re.split(r";\s*", rest) if x.strip()]
+            elif sep and key == "open questions":
+                open_qs += [x.strip() for x in re.split(r";\s*", rest) if x.strip()]
+            elif sep and key == "action items":
+                pass                              # the ACTION ITEMS list is the source
+            else:
+                summary.append(row.strip())
+        d["summary"] = "\n".join(summary)
+    else:
+        d["summary"] = "\n".join(body("SUMMARY"))
+    for row in body("BY PERSON"):
+        who, sep, said = row.partition(":")
+        d["by_person"].append({"name": who.strip(), "text": said.strip()} if sep
+                              else {"name": "", "text": row.strip()})
+    for row in body("OPEN QUESTIONS"):
+        qm = re.match(r"^- \[([ x])\] (.*)$", row)
+        if qm:
+            d["questions_to_ask"].append({"text": qm.group(2).strip(), "asked": qm.group(1) == "x"})
+        else:
+            open_qs.append(re.sub(r"^\s*-\s*", "", row).strip())
+    for row in body("QUESTIONS TO ASK"):
+        qm = re.match(r"^- \[([ x])\] (.*?)(?: \(asked\))?$", row)
+        if qm:
+            d["questions_to_ask"].append({"text": qm.group(2).strip(), "asked": qm.group(1) == "x"})
+    nothing = re.compile(r"^(?:none|n/?a|no (?:open )?(?:questions|decisions)|nothing)\b", re.I)
+    decisions = [x for x in decisions if x and not nothing.match(x)]
+    open_qs = [x for x in open_qs if x and not nothing.match(x)]
+    d["decisions"] = [{"id": f"d{i}", "text": t} for i, t in enumerate(decisions, 1)]
+    d["open_questions"] = [{"id": f"q{i}", "text": t, "status": "open"}
+                           for i, t in enumerate(open_qs, 1)]
+    d["questions_to_ask"] = [dict(q, id=f"t{i}") for i, q in enumerate(d["questions_to_ask"], 1)]
+    for i, row in enumerate(body("ACTION ITEMS"), 1):
+        am = re.match(r"^- \[([ x])\] (.*)$", row)
+        if not am:
+            continue
+        task, owner, due = am.group(2).strip(), "", ""
+        for pm in re.finditer(r"\((owner|due): ([^)]*)\)", task):          # v6 layout
+            if pm.group(1) == "owner":
+                owner = pm.group(2).strip()
+            else:
+                due = pm.group(2).strip()
+        task = re.sub(r"\s*\((?:owner|due): [^)]*\)", "", task)
+        pm = re.search(r"\s*\(([^()]*)\)$", task) if v8 else None          # v8 layout
+        if pm and not owner:
+            inside = pm.group(1)
+            parts = [p.strip() for p in inside.split(", due ")]
+            if parts[0] and parts[0] != "owner: ?":
+                owner = parts[0]
+            if len(parts) > 1:
+                due = parts[1]
+            task = task[:pm.start()]
+        d["action_items"].append({"id": f"a{i}", "text": task.strip(),
+                                  "owner": owner.rstrip("?") if owner != "?" else "",
+                                  "owner_sure": not owner.endswith("?"), "due": due,
+                                  "status": "done" if am.group(1) == "x" else "open",
+                                  "created_in": "", "source_time": "", "closed_at": "",
+                                  "closed_by": "", "close_evidence": ""})
+    for row in body("CONTEXT (Jira / Confluence)", "CONTEXT"):
+        d["context"].append({"title": re.sub(r"^\s*-\s*", "", row).strip(), "source": "",
+                             "detail": "", "url": ""})
+    for row in sections.get("FULL TRANSCRIPT", []) + sections.get("TRANSCRIPT", []):
+        lm = _LINE.match(row)
+        if not lm or lm.group(2).startswith(("YOU ASKED:", "CLAUDE:", "MEETING ENDED")):
+            continue
+        speaker, said = _split_speaker(lm.group(2))
+        d["transcript"].append({"t": lm.group(1), "speaker": speaker, "text": said})
+    if d["transcript"]:
+        start = start or d["transcript"][0]["t"][:5]
+        end = end or d["transcript"][-1]["t"][:5]
+    if not (d["transcript"] or d["summary"] or d["action_items"] or d["agenda"]
+            or d["questions_to_ask"]):
+        return None                              # an empty meeting: nothing to keep
+    if not d["participants"]:
+        seen = []
+        for row in d["transcript"]:
+            if row["speaker"] and row["speaker"] not in seen and row["speaker"] != "Others":
+                seen.append(row["speaker"])
+        d["participants"] = seen[:20]
+    if not d["title"]:
+        stem = re.sub(r"\s*-?\s*\d{4}-\d{2}-\d{2}.*$", "", name[:-4]).strip(" -_")
+        d["title"] = d["subject"] or (stem if stem and stem.lower() != "meeting" else "")
+    d["date"], d["start"], d["end"] = day, start, end
+    try:                                # 'today' / 'tomorrow' -> real dates of that meeting
+        base = datetime.date.fromisoformat(day)
+        for a in d["action_items"]:
+            a["due"] = real_dates(a["due"], base, due=True)
+            a["text"] = real_dates(a["text"], base)
+        d["summary"] = real_dates(d["summary"], base)
+    except ValueError:
+        pass
+    if profile.name:                    # old files said 'You' for the user
+        d["participants"] = [profile.name if p in ("You", "Me") else p for p in d["participants"]]
+        for row in d["transcript"]:
+            if row["speaker"] in ("You", "Me"):
+                row["speaker"] = profile.name
+    d["participants"] = [p for p in d["participants"] if p not in ("You", "Me")]
+    try:
+        t0 = datetime.datetime.strptime(start, "%H:%M")
+        t1 = datetime.datetime.strptime(end, "%H:%M")
+        d["duration_min"] = int((t1 - t0).total_seconds() // 60) % (24 * 60)
+    except ValueError:
+        d["duration_min"] = None
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:4]
+    d["id"] = f"{day.replace('-', '')}-{start.replace(':', '') or '0000'}-{digest}"
+    for a in d["action_items"]:
+        a["created_in"] = d["id"]
+    return d
+
+
+def import_old_meetings():
+    """One-time, best effort: make a meeting.json for every saved meeting .txt that
+    has none. Never changes or deletes a .txt. Returns how many were imported."""
+    import glob
+    count = 0
+    live = os.path.normcase(transcript.file_path or "")
+    for txt in glob.glob(os.path.join(SAVE_DIR, "*.txt")):
+        target = json_path_for(txt)
+        if os.path.exists(target) or os.path.normcase(txt) == live:
+            continue
+        data = parse_meeting_txt(txt)
+        if data is None:
+            continue
+        try:
+            _write_json(target, data)
+            count += 1
+        except OSError as e:
+            log.info("Could not import %s: %s", os.path.basename(txt), e)
+    if count:
+        log.info("Imported %d earlier meeting(s) into the history", count)
+    return count
+
+
+# ---- index (cache) and queries ----------------------------------------------------
+def _index_entry(d, stat):
+    summary = (d["summary"] or "").strip().splitlines()
+    line = summary[0] if summary else (d["agenda"][0]["text"] if d["agenda"] else "")
+    return {"id": d["id"], "path": d["_path"], "mtime": stat.st_mtime, "size": stat.st_size,
+            "title": d["title"] or d["subject"] or "Untitled meeting", "date": d["date"],
+            "start": d["start"], "end": d["end"], "participants": d["participants"],
+            "summary_line": line[:200], "imported": d["imported"],
+            "action_items": d["action_items"], "decisions": d["decisions"],
+            "open_questions": d["open_questions"], "questions_to_ask": d["questions_to_ask"],
+            "agenda": d["agenda"], "lines": len(d["transcript"])}
+
+
+def history_index():
+    """All meetings (newest first), from the cache; files that changed are re-read."""
+    import glob, json
+    with _history_lock:
+        import_old_meetings()
+        path = os.path.join(SAVE_DIR, INDEX_NAME)
+        try:
+            with open(path, encoding="utf-8") as f:
+                cache = json.load(f)
+            if cache.get("schema_version") != SCHEMA_VERSION:
+                cache = {}
+        except Exception:
+            cache = {}
+        old = {e["path"]: e for e in cache.get("meetings", [])}
+        entries, changed = [], False
+        for file in glob.glob(os.path.join(SAVE_DIR, "*" + MEETING_EXT)):
+            try:
+                stat = os.stat(file)
+            except OSError:
+                continue
+            e = old.get(file)
+            if e and e["mtime"] == stat.st_mtime and e["size"] == stat.st_size:
+                entries.append(e)
+                continue
+            try:
+                entries.append(_index_entry(load_meeting(file), stat))
+                changed = True
+            except Exception as ex:
+                log.info("Skipped unreadable meeting file %s: %s", os.path.basename(file), ex)
+        if changed or len(entries) != len(old):
+            try:
+                _write_json(path, {"schema_version": SCHEMA_VERSION, "meetings": entries})
+            except OSError:
+                pass
+        entries.sort(key=lambda e: (e["date"], e["start"]), reverse=True)
+        return entries
+
+
+def _in_range(e, date_from, date_to):
+    return (not date_from or e["date"] >= date_from) and (not date_to or e["date"] <= date_to)
+
+
+def _day_label(e):
+    try:
+        d = datetime.date.fromisoformat(e["date"])
+        return f"{fmt_day(d)} {d.year}"
+    except Exception:
+        return e["date"] or "(no date)"
+
+
+def find_meeting(meeting_id):
+    for e in history_index():
+        if e["id"] == meeting_id:
+            return e
+    return None
+
+
 profile = Profile()
 transcript = Transcript()
 ui_queue = queue.Queue()        # server -> overlay
@@ -1086,6 +1568,11 @@ class LiveState:
         self.released = False    # Claude stopped listening after an ended meeting
         self.scanned_upto = 0    # transcript lines already scanned
         self.autofill_sent = False  # auto title/agenda note already sent this meeting
+        self.mode = "home"          # window screen: home, history or record
+        self.last_activity = time.time()   # last question or screen change (idle timer)
+        self.answer_target = "live"  # where show_suggestion goes: live, history, dropped
+        self.pending_info = {}      # meeting info given before Record was pressed
+        self.record_on_open = False  # open straight into a recording (user asked)
 
     def label(self):
         if self.released:
@@ -1590,7 +2077,7 @@ def meet_key(title):
     return m.group(0) if m else (title or "").lower()
 
 
-SIDENOTE_VERSION = "2026-11-12 v9"
+SIDENOTE_VERSION = "2026-11-12 v10"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -3002,7 +3489,8 @@ def update_mic(on_live_captions):
     """Mic on while Sidenote is open, a meeting is running and the source is Live
     Captions (Meet's captions already include the user). After 'blocked',
     'silent', 'missing' or 'error' it waits for the user (click in the footer)."""
-    want = window_open.is_set() and on_live_captions and not transcript.ended_at
+    want = window_open.is_set() and live.mode == "record" and on_live_captions \
+        and not transcript.ended_at
     if want and not mic.running.is_set() and mic.status not in MIC_NEEDS_USER:
         mic.start()
     elif not want and mic.running.is_set():
@@ -3040,13 +3528,14 @@ def captions_loop():
         while True:
             if IS_MAC and MAC_MIC_ENABLED:
                 update_mic(active is not None and active not in named)
-            if not window_open.is_set():
+            if not window_open.is_set() or live.mode != "record":
                 for reader in named:
                     reader.reset()
                     reader.auto.clear()
                 windows.reset()
                 active = None
-                transcript.status = "Sidenote closed"
+                transcript.status = "Sidenote closed" if not window_open.is_set() \
+                    else "Not recording"
                 transcript.source = ""
                 time.sleep(POLL_SECONDS)
                 continue
@@ -3331,12 +3820,24 @@ mcp = FastMCP(
         "info tells you which source is active. Captions may contain small recognition "
         "errors; read them charitably.\n\n"
         "OPENING: the Sidenote window is hidden until the user asks for it. When the "
-        "user says 'start Sidenote' or 'open Sidenote', call open_sidenote. Pass the "
-        "meeting title, agenda, role, goals and participants if the user gave them in "
-        "their message. Each open starts a new meeting, unless the user says to continue "
-        "the same meeting (then pass new_meeting=false). If no title or agenda was given, "
-        "show a short tip in the overlay with show_suggestion, e.g. 'Tell me the meeting "
-        "title, agenda and your role, or click Meeting info.'\n\n"
+        "user says 'start Sidenote' or 'open Sidenote', call open_sidenote: the window "
+        "opens on its Home screen, where the user chooses Record a meeting or History. "
+        "Pass new_meeting=true only if the user explicitly asked to record or start a "
+        "meeting now. Pass the meeting title, agenda, role, goals and participants if the "
+        "user gave them. Start the wait_for_question loop right away in every case, "
+        "without asking anything in the chat. Never close the Sidenote window yourself: "
+        "call close_sidenote only when the user explicitly asks to close it.\n\n"
+        "HISTORY: every meeting is saved in Documents/Sidenote, and these tools read them "
+        "even when the window is closed (also from a normal chat): list_meetings (cheap, "
+        "call it first), find_items (action items, decisions, questions across meetings), "
+        "get_meeting (recap and lists; transcript only with include_transcript=true), "
+        "search_transcripts (snippets) and update_item (status only). Always name the "
+        "source meeting and date. Keep answers compact; load transcripts only when the "
+        "user asks for detail. Action items stay open until the user ticks them or "
+        "explicitly asks you to close them: never close one on your own inference, never "
+        "suggest closing items during a meeting, and if the user's request could match more "
+        "than one open item, ask which one first. When you close one, pass the user's "
+        "request as evidence.\n\n"
         "MEETING INFO: the meeting title, agenda, the user's role, goals and participants "
         "are sent to you with every question. Always use them: tie your answers to the "
         "agenda, the user's role and goals. When a message from the user contains new "
@@ -3353,7 +3854,13 @@ mcp = FastMCP(
         "answer with show_suggestion, then call wait_for_question again right away. "
         "When it returns NO_QUESTION, just call it again. Do not write long chat "
         "messages between calls; the user reads the overlay, not the chat. When it "
-        "returns STOP or CLOSED, follow its instructions and stop the loop.\n\n"
+        "returns STOP, CLOSED or IDLE, follow its instructions and stop the loop. "
+        "HISTORY QUESTION results come from the History screen: answer them about past "
+        "meetings. During a recording, answer from the live transcript unless the question "
+        "refers to the past ('last time', 'before', 'in October', a meeting name) or the live "
+        "transcript can't answer it; then check past meetings with the cheap history tools "
+        "first and name the source meeting and date. If unclear, answer from the live "
+        "meeting and add one line offering to check past meetings.\n\n"
         "Answers in the overlay: 1-3 short, concrete points (questions to ask, "
         "uncovered agenda items, missing decisions or owners), under 70 words, plain "
         "text, in the language the user wrote in.\n\n"
@@ -3452,6 +3959,7 @@ def _end_instructions(kind):
 LISTEN_NOW = (
     "\n\nLISTEN NOW: immediately call wait_for_question and keep calling it in a loop "
     "(after every answer, SCAN or NO_QUESTION) until it returns STOP, CLOSED or IDLE. "
+    "Never close the Sidenote window yourself. "
     "Do NOT stop to ask the user for a title, agenda, role or participants in the chat; "
     "missing meeting info is fine. If none was given, you may show one short tip in the "
     "overlay with show_suggestion, then start the loop. Do not write chat messages "
@@ -3469,31 +3977,39 @@ LIVE_NEXT = ("\n\nFIRST STEP (required): if you have Jira or Confluence tools in
              "add_context_item." + LISTEN_NOW)
 
 
-def core_open_sidenote(new_meeting=True, title="", agenda="", role="", goals="",
+def core_open_sidenote(new_meeting=False, title="", agenda="", role="", goals="",
                        participants="", user_name=""):
-    if window_open.is_set() and transcript.ended_at and new_meeting:
-        transcript.new_meeting()
-        core_update_meeting_info(title=title, agenda=agenda, role=role, goals=goals,
-                                 participants=participants, user_name=user_name)
-        ui_queue.put(("new_meeting", None))
-        return ("New meeting started in the open Sidenote window.\n\n"
-                + transcript.context_text() + LIVE_NEXT)
+    """Opens the window on its Home screen (Record a meeting / History). Records
+    right away only if the user asked for it (new_meeting=True)."""
+    if user_name:
+        set_user_name(user_name, "claude")
+    info = {k: v for k, v in (("title", title), ("agenda", agenda), ("role", role),
+                              ("goals", goals), ("participants", participants)) if v}
+    live.last_activity = time.time()
     if window_open.is_set():
-        if any((title, agenda, role, goals, participants, user_name)):
-            core_update_meeting_info(title=title, agenda=agenda, role=role, goals=goals,
-                                     participants=participants, user_name=user_name)
-            return "Sidenote is already open. Meeting info updated." + LIVE_NEXT
-        return "Sidenote is already open." + LIVE_NEXT
-    if new_meeting:
-        transcript.new_meeting()
-    core_update_meeting_info(title=title, agenda=agenda, role=role, goals=goals,
-                             participants=participants, user_name=user_name)
+        recording = live.mode == "record" and not transcript.ended_at
+        if new_meeting and not recording:
+            ui_queue.put(("record", info))
+            return "Recording a new meeting in the open Sidenote window." + LIVE_NEXT
+        if info and recording:
+            core_update_meeting_info(**info)
+            return "Sidenote is open and recording. Meeting info updated." + LIVE_NEXT
+        if info:
+            live.pending_info.update(info)
+        where = "recording a meeting" if recording else f"on its {live.mode.capitalize()} screen"
+        return f"Sidenote is already open, {where}." + LIVE_NEXT
+    live.pending_info = info
+    live.record_on_open = bool(new_meeting)
+    live.mode = "record" if new_meeting else "home"
     open_request.set()
     for _ in range(50):
         if window_open.is_set():
-            return "Sidenote is open.\n\n" + transcript.context_text() + LIVE_NEXT
+            break
         time.sleep(0.1)
-    return "Opening Sidenote... (it may take a second to appear)" + LIVE_NEXT
+    if new_meeting:
+        return "Sidenote is open and recording a new meeting." + LIVE_NEXT
+    return ("Sidenote is open on its Home screen: the user chooses Record a meeting or "
+            "History. Don't ask them anything in the chat." + LIVE_NEXT)
 
 
 def end_if_needed():
@@ -3630,11 +4146,47 @@ def _scan_if_ready():
             + _autofill_note() + context_guidance())
 
 
+def _history_idle():
+    return live.mode != "record" and time.time() - live.last_activity > HISTORY_IDLE_SECONDS
+
+
+HISTORY_IDLE_TEXT = ("IDLE: no questions for 15 minutes on Sidenote's Home/History screen. Stop "
+                     "calling wait_for_question. Tell the user in one short line that Sidenote "
+                     "is idle and that typing 'open Sidenote' in Claude reconnects it.")
+
+
+def _history_question(q):
+    meeting_id = q.get("meeting_id") or ""
+    e = find_meeting(meeting_id) if meeting_id else None
+    scope = (f"the meeting \u201c{e['title']}\u201d ({_day_label(e)}, id {e['id']})" if e
+             else "all past meetings")
+    text = (f"HISTORY QUESTION (asked on Sidenote's History screen, about {scope}): "
+            f"{q.get('text', '')}\n\n"
+            "Answer from the saved meetings with the history tools. Start cheap: "
+            "list_meetings, find_items, get_meeting (no transcript). Load a transcript "
+            "(get_meeting with include_transcript=true, or search_transcripts) only if the "
+            "user asks for detail the recap doesn't have. Name the source meeting and date for "
+            "everything you say (e.g. 'from the Nov 5 sync with Lee'). Short plain text, under "
+            "120 words. Change an item's status only if the user explicitly asks (update_item "
+            "with their words as evidence); if more than one item could match, ask which one "
+            "first. Send the answer with show_suggestion (it appears in the History chat), then "
+            "call wait_for_question again.")
+    if e:
+        text += "\n\n--- SELECTED MEETING ---\n" + core_get_meeting(e["id"])
+    return text
+
+
 def core_wait_for_question(timeout_seconds=WAIT_DEFAULT_SECONDS):
-    timeout = max(5, min(int(timeout_seconds), 300))
+    start_mode = live.mode
+    timeout = max(5, min(int(timeout_seconds), 300)) if start_mode == "record" \
+        else HISTORY_WAIT_SECONDS
     if not window_open.is_set():
         return _end_instructions("CLOSED")
-    if transcript.ended_at and \
+    if _history_idle():
+        live.released = True
+        ui_queue.put(("idle", None))
+        return HISTORY_IDLE_TEXT
+    if live.mode == "record" and transcript.ended_at and \
             (datetime.datetime.now() - transcript.ended_at).total_seconds() > ENDED_GRACE_SECONDS:
         live.released = True
         return ("IDLE: the meeting ended and no new meeting was started. Stop calling "
@@ -3648,19 +4200,30 @@ def core_wait_for_question(timeout_seconds=WAIT_DEFAULT_SECONDS):
         while time.time() < deadline:
             if not window_open.is_set():
                 return _end_instructions("CLOSED")
-            if transcript.ended_at and (datetime.datetime.now() - transcript.ended_at
-                                        ).total_seconds() > ENDED_GRACE_SECONDS:
+            if live.mode == "record" and start_mode != "record":
+                return ("RECORDING STARTED: the user started recording a meeting in the "
+                        "Sidenote window. From now on questions are about the live meeting "
+                        "(see the scope rule). Call wait_for_question again now.")
+            if live.mode == "record" and transcript.ended_at and (
+                    datetime.datetime.now() - transcript.ended_at).total_seconds() > ENDED_GRACE_SECONDS:
+                break                        # next call returns IDLE
+            if _history_idle():
                 break                        # next call returns IDLE
             try:
                 question = question_queue.get(timeout=0.3)
             except queue.Empty:
-                scan = _scan_if_ready()
+                scan = _scan_if_ready() if live.mode == "record" else None
                 if scan:
                     return scan
                 continue
             if question == END_TOKEN:
                 return _end_instructions("END")
             live.quiet_rounds = 0
+            live.last_activity = time.time()
+            if isinstance(question, dict):           # asked on the History screen
+                live.answer_target = "history"
+                return _history_question(question)
+            live.answer_target = "live"
             if question == MISSED_TOKEN:
                 recent = transcript.since(MISSED_MINUTES)
                 return (
@@ -3678,10 +4241,17 @@ def core_wait_for_question(timeout_seconds=WAIT_DEFAULT_SECONDS):
                 return _end_instructions("STOP")
             return (
                 f"QUESTION: {question}\n\n"
+                "Scope: answer from the live meeting unless the question refers to the past "
+                "('last time', 'before', a date, a meeting name) or the live transcript can't "
+                "answer it; then use find_items / list_meetings / get_meeting (no transcript) "
+                "and name the source meeting and date. If unclear, answer from the live meeting "
+                "and add one line offering to check past meetings.\n\n"
                 f"--- MEETING INFO (use it in your answer) ---\n{transcript.context_text()}\n\n"
                 f"--- TRANSCRIPT, LAST 5 MIN ---\n{transcript.since(5) or '(nothing captured)'}"
                 + context_guidance()
             )
+        if live.mode != "record":
+            return "NO_QUESTION: nothing asked yet. Call wait_for_question again."
         return ("NO_QUESTION: nothing typed yet. Call wait_for_question again."
                 + context_guidance(full=False))
     finally:
@@ -3823,6 +4393,239 @@ def core_save_recap(recap="", summary="", by_person="", decisions="", open_quest
     return f"Recap saved in {transcript.file_path}"
 
 
+# --- History (past meetings), read straight from Documents/Sidenote ---------------
+def _meeting_text(e):
+    return " ".join([e["title"], e["summary_line"], " ".join(e["participants"])]
+                    + [a["text"] + " " + (a.get("owner") or "") for a in e["action_items"]]
+                    + [x["text"] for x in e["decisions"] + e["open_questions"]]
+                    + [a["text"] for a in e["agenda"]]).lower()
+
+
+def _words_in(text, hay):
+    return all(w in hay for w in str(text or "").lower().split())
+
+
+def _open_actions(e):
+    return sum(1 for a in e["action_items"] if a.get("status") != "done")
+
+
+def core_list_meetings(date_from="", date_to="", text="", limit=30):
+    rows = [e for e in history_index() if _in_range(e, date_from, date_to)
+            and (not text or _words_in(text, _meeting_text(e)))]
+    if not rows:
+        return "No saved meetings match." + (" (No meetings saved yet.)" if not history_index() else "")
+    out = [f"{len(rows)} meeting(s), newest first. Next: get_meeting(meeting_id) for one "
+           "meeting, or find_items to search action items/decisions/questions across all."]
+    for e in rows[:limit]:
+        people = ", ".join(e["participants"][:4]) + (" ..." if len(e["participants"]) > 4 else "")
+        extra = f" | {_open_actions(e)} open action item(s)" if _open_actions(e) else ""
+        out.append(f"- {e['id']} | {_day_label(e)} {e['start']} | {e['title']}"
+                   f"{' | with ' + people if people else ''}{extra}"
+                   f"{' | ' + e['summary_line'] if e['summary_line'] else ''}")
+    if len(rows) > limit:
+        out.append(f"... {len(rows) - limit} more (narrow with date_from/date_to/text).")
+    return "\n".join(out)
+
+
+def _action_line(a):
+    meta = ", ".join(x for x in (
+        f"owner {a['owner']}" if a.get("owner") else "owner unknown",
+        f"due {a['due']}" if a.get("due") else "") if x)
+    closed = ""
+    if a.get("status") == "done" and a.get("closed_by") == "claude":
+        closed = f" (closed by Claude: “{a.get('close_evidence', '')}”)"
+    return f"[{a.get('status', 'open')}] {a['text']} — {meta}{closed}"
+
+
+def core_get_meeting(meeting_id, include_transcript=False):
+    e = find_meeting(str(meeting_id).strip())
+    if e is None:
+        return f"No meeting with id {meeting_id}. Use list_meetings to find ids."
+    d = load_meeting(e["path"])
+    out = [f"MEETING {d['id']}: {d['title'] or 'Untitled meeting'} — {_day_label(e)}, "
+           f"{d['start']}-{d['end']}" + (f" ({d['duration_min']} min)" if d["duration_min"] else "")]
+    if d["imported"]:
+        out.append("(Imported from an older Sidenote file: some fields may be missing.)")
+    if d["participants"]:
+        out.append("Participants: " + ", ".join(d["participants"]))
+    if d["agenda"]:
+        out.append("Agenda: " + "; ".join(f"[{'x' if a.get('covered') else ' '}] {a['text']}"
+                                          for a in d["agenda"]))
+    if d["summary"]:
+        out.append("Summary: " + d["summary"])
+    if d["by_person"]:
+        out.append("By person:\n" + "\n".join(f"- {p['name'] + ': ' if p['name'] else ''}{p['text']}"
+                                              for p in d["by_person"]))
+    if d["decisions"]:
+        out.append("Decisions:\n" + "\n".join(f"- {x['id']}: {x['text']}" for x in d["decisions"]))
+    if d["open_questions"]:
+        out.append("Open questions:\n" + "\n".join(f"- {x['id']} [{x.get('status', 'open')}]: "
+                                                   f"{x['text']}" for x in d["open_questions"]))
+    if d["action_items"]:
+        out.append("Action items:\n" + "\n".join(f"- {a['id']} {_action_line(a)}"
+                                                 for a in d["action_items"]))
+    if d["questions_to_ask"]:
+        out.append("Questions the user saved to ask:\n" + "\n".join(
+            f"- {q['id']} [{'asked' if q.get('asked') else 'not asked'}]: {q['text']}"
+            for q in d["questions_to_ask"]))
+    n = len(d["transcript"])
+    if include_transcript and n:
+        rows = d["transcript"][:2000]
+        out.append(f"Transcript ({n} lines):\n" + "\n".join(
+            f"[{r['t']}] {r['speaker'] + ': ' if r['speaker'] else ''}{r['text']}" for r in rows)
+            + ("\n... (truncated)" if n > 2000 else ""))
+    else:
+        out.append(f"Transcript: {n} line(s); only load it (include_transcript=true) if the user "
+                   "asks for details the recap doesn't have, or use search_transcripts.")
+    return "\n".join(out)
+
+
+def _owner_matches(owner, wanted):
+    wanted = str(wanted or "").strip()
+    if not wanted:
+        return True
+    if wanted.lower() in SELF_WORDS and profile.name:
+        wanted = profile.name
+    owner = owner or ""
+    return wanted.lower() in owner.lower() or (" " in owner and " " in wanted
+                                                and _same_person(owner, wanted))
+
+
+def core_find_items(kind="action", date_from="", date_to="", owner="", status="open", text="",
+                    limit=60):
+    kind = str(kind or "action").lower().rstrip("s")
+    kind = {"task": "action", "action item": "action", "todo": "action",
+            "open question": "question"}.get(kind, kind)
+    if kind not in ("action", "decision", "question"):
+        return "kind must be 'action', 'decision' or 'question'."
+    status = str(status or "any").lower()
+    found = []
+    for e in history_index():
+        if not _in_range(e, date_from, date_to):
+            continue
+        where = f"{e['title']}, {_day_label(e)} | meeting {e['id']}"
+        if kind == "action":
+            for a in e["action_items"]:
+                st = a.get("status", "open")
+                if (status in ("any", "all", "") or st == status) and \
+                        _owner_matches(a.get("owner"), owner) and _words_in(text, a["text"].lower()):
+                    found.append(f"- {_action_line(a)} | {where}, item {a['id']}")
+        elif kind == "decision":
+            for x in e["decisions"]:
+                if _words_in(text, x["text"].lower()):
+                    found.append(f"- {x['text']} | {where}, item {x['id']}")
+        else:
+            for x in e["open_questions"]:
+                st = x.get("status", "open")
+                if (status in ("any", "all", "") or st == status) and _words_in(text, x["text"].lower()):
+                    found.append(f"- [{st}] {x['text']} | {where}, item {x['id']}")
+            for q in e["questions_to_ask"]:
+                st = "asked" if q.get("asked") else "open"
+                if (status in ("any", "all", "") or st == status) and _words_in(text, q["text"].lower()):
+                    found.append(f"- [{st}, saved to ask] {q['text']} | {where}, item {q['id']}")
+    if not found:
+        return f"No {kind} items match."
+    head = f"{len(found)} {kind} item(s), newest meetings first. Always name the source meeting and date."
+    return "\n".join([head] + found[:limit] + ([f"... {len(found) - limit} more."]
+                                                if len(found) > limit else []))
+
+
+def core_search_transcripts(text, date_from="", date_to="", max_results=20):
+    words = str(text or "").lower().split()
+    if not words:
+        return "Give some words to search for."
+    out, hits = [], 0
+    for e in history_index():
+        if hits >= max_results or not _in_range(e, date_from, date_to) or not e["lines"]:
+            continue
+        rows = load_meeting(e["path"])["transcript"]
+        for i, r in enumerate(rows):
+            if hits >= max_results:
+                break
+            if all(w in r["text"].lower() or w in r["speaker"].lower() for w in words):
+                hits += 1
+                ctx = rows[max(0, i - 2): i + 3]
+                out.append(f"{e['title']} ({_day_label(e)}, meeting {e['id']}) at {r['t']}:\n"
+                           + "\n".join(f"  {'>' if c is r else ' '} [{c['t']}] "
+                                       f"{c['speaker'] + ': ' if c['speaker'] else ''}{c['text']}"
+                                       for c in ctx))
+    if not out:
+        return "No transcript lines match."
+    return f"{hits} match(es) (snippets, not whole transcripts):\n\n" + "\n\n".join(out)
+
+
+ITEM_STATUSES = {"action": {"done": "done", "closed": "done", "complete": "done",
+                            "completed": "done", "open": "open", "reopen": "open"},
+                 "question": {"answered": "answered", "closed": "answered", "done": "answered",
+                              "asked": "answered", "open": "open", "reopen": "open"}}
+
+
+def core_update_item(meeting_id, kind, item_id, status, evidence="", by="claude"):
+    """Change an item's status only (never its text, never deletes)."""
+    kind = str(kind or "").lower().rstrip("s")
+    kind = "action" if kind.startswith("action") else kind
+    if kind == "decision":
+        return "Decisions have no status; nothing changed."
+    if kind not in ITEM_STATUSES:
+        return "kind must be 'action' or 'question'."
+    new = ITEM_STATUSES[kind].get(str(status or "").lower())
+    if new is None:
+        return f"status must be one of: {', '.join(sorted(set(ITEM_STATUSES[kind].values())))}."
+    evidence = str(evidence or "").strip()
+    if by == "claude" and new in ("done", "answered") and not evidence:
+        return ("Not changed: when you close an item, pass the user's request as evidence. Only "
+                "close items the user explicitly asked you to close.")
+    meeting_id = str(meeting_id).strip()
+    if meeting_id == transcript.meeting_id:
+        text = transcript.update_item(kind, item_id, new, by, evidence)
+        transcript.save_now()                  # History reads the file: write it now
+        title = transcript.display_title() or "this meeting"
+        ui_queue.put(("lists", None))
+    else:
+        e = find_meeting(meeting_id)
+        if e is None:
+            return f"No meeting with id {meeting_id}."
+        with _history_lock:
+            d = load_meeting(e["path"])
+            text = _set_item_status(d, kind, item_id, new, by, evidence)
+            if text is not None:
+                d.pop("_path", None)
+                _write_json(e["path"], d)
+        title = e["title"]
+    if text is None:
+        return f"No {kind} item {item_id} in meeting {meeting_id}. Use get_meeting to see ids."
+    ui_queue.put(("history_changed", meeting_id))
+    who = " (closed by Claude; the user can undo it in History)" if by == "claude" and \
+        new in ("done", "answered") else ""
+    return f"Updated: {kind} {item_id} “{text}” in “{title}” is now {new}{who}."
+
+
+def _set_item_status(d, kind, item_id, new, by, evidence):
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    if kind == "action":
+        for a in d["action_items"]:
+            if a["id"] == item_id:
+                a["status"] = new
+                if new == "done":
+                    a.update(closed_at=now, closed_by=by,
+                             close_evidence=evidence if by == "claude" else "")
+                else:
+                    a.update(closed_at="", closed_by="", close_evidence="")
+                return a["text"]
+        return None
+    for q in d["open_questions"]:
+        if q["id"] == item_id:
+            q["status"] = new
+            q["closed_by"] = by if new == "answered" else ""
+            q["close_evidence"] = evidence if new == "answered" and by == "claude" else ""
+            return q["text"]
+    for q in d["questions_to_ask"]:
+        if q["id"] == item_id:
+            q["asked"] = new == "answered"
+            return q["text"]
+    return None
+
+
 def core_debug_call_window(app="teams"):
     app = str(app or "").strip().lower()
     app = "teams" if "team" in app else "zoom" if "zoom" in app else app
@@ -3862,12 +4665,23 @@ def core_get_meeting_context():
 
 def core_show_suggestion(text):
     text = text.strip()
+    if live.answer_target == "history":
+        ui_queue.put(("history_answer", text))
+        return "Shown in the History chat."
+    if live.answer_target == "dropped":
+        live.answer_target = "live"
+        return ("Not shown: the user started recording a meeting, so the History question was "
+                "dropped. Call wait_for_question.")
     transcript.add_note("CLAUDE", text)
     ui_queue.put(("suggestion", text))
     return "Shown in the overlay."
 
 
 def core_start_new_meeting(title=""):
+    if window_open.is_set():
+        ui_queue.put(("record", {"title": title} if title else {}))
+        return ("Recording a new meeting in the Sidenote window. The previous meeting file is "
+                "saved in Documents/Sidenote.")
     transcript.new_meeting(title)
     ui_queue.put(("info", None))
     ui_queue.put(("suggestion", "New meeting started."))
@@ -3905,6 +4719,11 @@ OPS = {
     "debug_call_window": core_debug_call_window,
     "debug_live_captions_tree": core_debug_live_captions_tree,
     "show_suggestion": core_show_suggestion,
+    "list_meetings": core_list_meetings,
+    "get_meeting": core_get_meeting,
+    "find_items": core_find_items,
+    "search_transcripts": core_search_transcripts,
+    "update_item": core_update_item,
     "start_new_meeting": core_start_new_meeting,
     "get_status": core_get_status,
     "open_sidenote": core_open_sidenote,
@@ -3977,13 +4796,15 @@ async def run(op, **kwargs):
 
 # --- MCP tools ---------------------------------------------------------------
 @mcp.tool()
-async def open_sidenote(new_meeting: bool = True, title: str = "", agenda: str = "",
+async def open_sidenote(new_meeting: bool = False, title: str = "", agenda: str = "",
                         role: str = "", goals: str = "", participants: str = "",
                         user_name: str = "") -> str:
-    """Show the Sidenote window and start reading Live Captions. Use when the user
-    says 'start Sidenote' or 'open Sidenote'. Starts a new meeting unless
-    new_meeting is false. Optionally pass the meeting title, agenda (one item per
-    line), the user's role, goals and participants (comma separated).
+    """Show the Sidenote window. Use when the user says 'start Sidenote' or 'open
+    Sidenote'. It opens on the Home screen (Record a meeting / History); pass
+    new_meeting=true only if the user explicitly asked to record a meeting now.
+    Optionally pass the meeting title, agenda (one item per line), the user's
+    role, goals and participants (comma separated); they are used when recording
+    starts.
     user_name: the user's own name, if you know it (Sidenote uses it instead of
     'You' everywhere; a name the user typed in Sidenote takes priority).
     Right after this returns, call wait_for_question and keep calling it in a
@@ -3996,7 +4817,8 @@ async def open_sidenote(new_meeting: bool = True, title: str = "", agenda: str =
 
 @mcp.tool()
 async def close_sidenote() -> str:
-    """Close the Sidenote window and stop reading Live Captions."""
+    """Close the Sidenote window. Only when the user explicitly asks to close it;
+    never on your own (the user closes it, or keeps it open between meetings)."""
     return await run("close_sidenote")
 
 
@@ -4154,6 +4976,55 @@ async def start_new_meeting(title: str = "") -> str:
 
 
 @mcp.tool()
+async def list_meetings(date_from: str = "", date_to: str = "", text: str = "") -> str:
+    """Past meetings saved by Sidenote (works even when the Sidenote window is
+    closed): id, date, title, participants, open action items, one-line summary.
+    Cheap: call this first. date_from/date_to: YYYY-MM-DD (inclusive). text: words
+    to match in titles, summaries, participants and items."""
+    return await run("list_meetings", date_from=date_from, date_to=date_to, text=text)
+
+
+@mcp.tool()
+async def get_meeting(meeting_id: str, include_transcript: bool = False) -> str:
+    """One saved meeting: recap, by person, decisions, open questions, action items
+    (with item ids). The transcript is only included with include_transcript=true:
+    use that only when the user asks for detail the recap doesn't have."""
+    return await run("get_meeting", meeting_id=meeting_id, include_transcript=include_transcript)
+
+
+@mcp.tool()
+async def find_items(kind: str = "action", date_from: str = "", date_to: str = "",
+                     owner: str = "", status: str = "open", text: str = "") -> str:
+    """Search structured items across all saved meetings. kind: 'action' (action
+    items), 'decision' or 'question' (open questions and questions the user saved
+    to ask). status: 'open', 'done' (actions), 'answered' (questions) or 'any'.
+    owner: a name ('me' = the user). Each result names its meeting, date and ids.
+    Use this for 'my open action items', 'what did we decide about X'."""
+    return await run("find_items", kind=kind, date_from=date_from, date_to=date_to,
+                     owner=owner, status=status, text=text)
+
+
+@mcp.tool()
+async def search_transcripts(text: str, date_from: str = "", date_to: str = "") -> str:
+    """Search the words people said in saved meetings. Returns short snippets (a few
+    lines of context) with meeting, date and time, never whole transcripts. Use it
+    when the recap and items don't answer the question."""
+    return await run("search_transcripts", text=text, date_from=date_from, date_to=date_to)
+
+
+@mcp.tool()
+async def update_item(meeting_id: str, kind: str, item_id: str, status: str,
+                      evidence: str = "") -> str:
+    """Change the status of a saved item; never its text, never deletes. kind:
+    'action' (status 'done' or 'open') or 'question' ('answered' or 'open').
+    Only when the user explicitly asks; if more than one item could match, ask
+    which one first. evidence: the user's request, word for word (required to
+    close an item). The user can undo it in the History screen."""
+    return await run("update_item", meeting_id=meeting_id, kind=kind, item_id=item_id,
+                     status=status, evidence=evidence, by="claude")
+
+
+@mcp.tool()
 async def get_status() -> str:
     """Check whether Live Captions is connected, and where the meeting file is saved."""
     return await run("get_status")
@@ -4249,9 +5120,10 @@ class Overlay:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         pad = 16
+        self.rec = tk.Frame(self.root, bg=BG)      # the Record screen (shown via show_screen)
 
         # ---- header ---------------------------------------------------------
-        header = tk.Frame(self.root, bg=BG)
+        header = tk.Frame(self.rec, bg=BG)
         header.pack(fill="x", padx=pad, pady=(14, 0))
         self.menu_btn = tk.Label(header, text="⋯", bg=BG, fg=MUTED, cursor="hand2",
                                  font=(FONT, 16), padx=6)
@@ -4261,7 +5133,7 @@ class Overlay:
         self.end_btn = tk.Label(end_border, text="End meeting", bg=BG, fg=MUTED, cursor="hand2",
                                 font=(FONT, 9), padx=10, pady=3)
         self.end_btn.pack()
-        self.end_btn.bind("<Button-1>", self.end_meeting)
+        self.end_btn.bind("<Button-1>", self._end_btn_click)
         self._hover(self.end_btn, BG, SURFACE, fg_on=FG, fg_off=MUTED)
         self.menu_btn.bind("<Button-1>", self.open_menu)
         self._hover(self.menu_btn, BG, SURFACE, fg_on=FG, fg_off=MUTED)
@@ -4277,7 +5149,7 @@ class Overlay:
         self.info_label.bind("<Button-1>", lambda e: self._edit_info_from_click())
 
         # View toggles: open lists next to the answer when you want them
-        chips = tk.Frame(self.root, bg=BG)
+        chips = tk.Frame(self.rec, bg=BG)
         chips.pack(fill="x", padx=pad, pady=(6, 0))
         self.show_label = tk.Label(chips, text="Show", bg=BG, fg=FAINT, font=(FONT, 8))
         self.show_label.pack(side="left", padx=(0, 6))
@@ -4305,11 +5177,11 @@ class Overlay:
             self.chips[key] = {"frame": chip, "border": chip_border, "box": box,
                                "name": name, "badge": badge}
 
-        self._divider = tk.Frame(self.root, bg=LINE, height=1)
+        self._divider = tk.Frame(self.rec, bg=LINE, height=1)
         self._divider.pack(fill="x", padx=pad, pady=(6, 0))
 
         # ---- name question: asked once, inline (no popup, never takes focus) --
-        self.name_bar = tk.Frame(self.root, bg=SURFACE, padx=10, pady=6)
+        self.name_bar = tk.Frame(self.rec, bg=SURFACE, padx=10, pady=6)
         tk.Label(self.name_bar, text="What name should Sidenote use for you?", bg=SURFACE,
                  fg=FG, font=(FONT, 9), anchor="w").pack(fill="x")
         row = tk.Frame(self.name_bar, bg=SURFACE)
@@ -4346,7 +5218,7 @@ class Overlay:
         self.caption_dot.pack(side="right", padx=(0, 4))
 
         # ---- input ----------------------------------------------------------
-        input_box = tk.Frame(self.root, bg=SURFACE, highlightthickness=1,
+        input_box = tk.Frame(self.rec, bg=SURFACE, highlightthickness=1,
                              highlightbackground=LINE, highlightcolor=ACCENT)
         input_box.pack(side="bottom", fill="x", padx=pad, pady=(4, 0))
         # Grows from 1 to 4 lines as you type, then scrolls (Shift+Enter = new line)
@@ -4368,7 +5240,7 @@ class Overlay:
         self._show_placeholder()
 
         # ---- suggested prompt (just above the input; click = as if typed) ------
-        self.suggest_row = tk.Frame(self.root, bg=BG)
+        self.suggest_row = tk.Frame(self.rec, bg=BG)
         self.suggest_row.pack(side="bottom", fill="x", padx=pad, pady=self.SUGGEST_PADY)
         # Looks like an autosuggestion: faint italic text with a sparkle, no box
         self.missed_btn = tk.Label(self.suggest_row, text="\u2726  " + self.MISSED_PROMPT,
@@ -4381,12 +5253,12 @@ class Overlay:
                         add=False)
 
         # ---- hearing line -----------------------------------------------------
-        self.tail = tk.Label(self.root, text="", bg=BG, fg=FAINT, font=(FONT, 8, "italic"),
+        self.tail = tk.Label(self.rec, text="", bg=BG, fg=FAINT, font=(FONT, 8, "italic"),
                              justify="left", anchor="w", wraplength=w - 2 * pad)
         self.tail.pack(side="bottom", fill="x", padx=pad, pady=(8, 0))
 
         # ---- answer (main content) -------------------------------------------
-        self.paned = tk.PanedWindow(self.root, orient="vertical", bg=BG, bd=0,
+        self.paned = tk.PanedWindow(self.rec, orient="vertical", bg=BG, bd=0,
                                     sashwidth=10, sashrelief="flat", showhandle=False,
                                     opaqueresize=True)
         self.paned.pack(fill="both", expand=True, padx=pad, pady=(8, 0))
@@ -4458,13 +5330,15 @@ class Overlay:
         self._pending_hint = "Thinking…"   # under a question Claude hasn't answered yet
         self._feed_sig = None          # what the conversation view shows now
 
-        if transcript.ended_at:
-            self.end_btn.configure(text="Ended", fg=FAINT, cursor="arrow")
-            self.end_btn.unbind("<Enter>")
-            self.end_btn.unbind("<Leave>")
         self.root.bind("<Configure>", self._on_resize)
-        self.update_info()
         self._set_answer("", empty=True)
+        self.screen = "home"
+        self._build_home()
+        self._build_history()
+        if live.record_on_open:                  # the user asked Claude to record right away
+            self.start_recording()
+        else:
+            self.show_screen("home")
         self.root.after(300, self.refresh)
 
     # ---- remembered window size and position -------------------------------------
@@ -4770,6 +5644,10 @@ class Overlay:
         with transcript.lock:
             c = dict(transcript.context)
         title = c["title"] or c["subject"]
+        if getattr(self, "screen", "record") != "record":
+            self.root.title(f"Sidenote {SIDENOTE_VERSION}"
+                            + (" - History" if self.screen == "history" else ""))
+            return
         self.title_label.configure(text=title or "Untitled meeting",
                                    fg=FG if title else MUTED, cursor="hand2")
         # Version in the window title is a testing aid (remove before release)
@@ -4806,6 +5684,8 @@ class Overlay:
                        activeforeground="#ffffff", bd=0, font=(FONT, 9))
         menu.bind("<Unmap>", lambda e: setattr(self, "_menu_closed_at", time.time()))
         menu.add_command(label="Meeting info...", command=self.edit_info)
+        menu.add_command(label="Home", command=self.go_home)
+        menu.add_command(label="Meeting history", command=self.go_history)
         menu.add_command(label="Hide Live Captions" if not captions_win.hide_wanted
                          else "Show Live Captions", command=self.toggle_captions)
         menu.add_command(label="Open meetings folder", command=self.open_folder)
@@ -4898,7 +5778,7 @@ class Overlay:
                 cc["role"] = get("role")
                 cc["goals"] = get("goals")
                 cc["participants"] = parse_list(get("participants"))
-                cc["agenda"] = parse_list(get("agenda")) if get("agenda") else []
+                cc["agenda"] = parse_list(get("agenda"), commas=False) if get("agenda") else []
                 cc["agenda_done"] = [a for a in cc["agenda_done"] if a in cc["agenda"]]
             profile.set_role(get("role"))         # an empty field clears the saved role
             if get("name") != profile.name:
@@ -5004,16 +5884,13 @@ class Overlay:
 
     def new_meeting(self):
         from tkinter import messagebox
-        if not messagebox.askyesno(
-                "New meeting",
-                "Start a new meeting?\n\nThe current meeting is saved, then the transcript "
-                "and meeting info are cleared.", parent=self.root):
+        if live.mode == "record" and not transcript.ended_at and transcript.count_lines() and \
+                not messagebox.askyesno(
+                    "New meeting",
+                    "Start a new meeting?\n\nThe current meeting is saved, then the transcript "
+                    "and meeting info are cleared.", parent=self.root):
             return
-        transcript.new_meeting()
-        if live.released or not (live.waiting or live.label().startswith("Claude")):
-            self._reset_view("New meeting started \u00b7 type 'open Sidenote' in Claude to connect")
-        else:
-            self._reset_view("New meeting started. The previous one is saved.")
+        self.start_recording()
 
     def _reset_view(self, message):
         self.end_btn.configure(text="End meeting", fg=MUTED, cursor="hand2")
@@ -5048,9 +5925,7 @@ class Overlay:
                 "and everything is saved in the meeting file.", parent=self.root):
             return
         transcript.end_meeting()
-        self.end_btn.configure(text="Ended", fg=FAINT, cursor="arrow")
-        self.end_btn.unbind("<Enter>")
-        self.end_btn.unbind("<Leave>")
+        self.end_btn.configure(text="\u2190 Home", fg=MUTED, cursor="hand2")
         connected = live.waiting or live.label().startswith("Claude")
         if connected:
             question_queue.put(END_TOKEN)
@@ -5059,6 +5934,507 @@ class Overlay:
             self._set_answer("Meeting ended and saved.\n\nClaude isn't connected right now, "
                              "so there's no recap yet. Type 'recap the meeting' in the "
                              "Claude app to add one.")
+
+    # ---- screens: Home, History, Record ------------------------------------------------
+    def show_screen(self, name):
+        for frame in (self.rec, self.home, self.hist):
+            frame.pack_forget()
+        {"record": self.rec, "home": self.home, "history": self.hist}[name].pack(
+            fill="both", expand=True)
+        self.screen = name
+        if name != "record":
+            live.mode = name
+        live.last_activity = time.time()
+        if name == "history":
+            self.history_render(reload=True)
+        if name == "home":
+            self._home_refresh()
+        self.update_info()
+
+    def start_recording(self, info=None):
+        """Record a meeting (from Home, History, the menu or open_sidenote)."""
+        if self._h_waiting:                          # a History question is being answered
+            live.answer_target = "dropped"
+            self._h_waiting = False
+            self._h_chat.append(("note", "Recording started: that question was cancelled."))
+        kept = []
+        while True:                                  # drop History questions not taken yet
+            try:
+                item = question_queue.get_nowait()
+            except queue.Empty:
+                break
+            if not isinstance(item, dict):
+                kept.append(item)
+        for item in kept:
+            question_queue.put(item)
+        transcript.new_meeting()
+        info = dict(live.pending_info, **(info or {}))
+        live.pending_info = {}
+        if info:
+            core_update_meeting_info(**info)
+        live.mode = "record"
+        live.record_on_open = False
+        live.last_activity = time.time()
+        captions_win.hide_wanted = True
+        try:
+            captions_win.ensure_running()            # Live Captions only while recording
+        except Exception as e:
+            log.info("Could not start Live Captions: %s", e)
+        self.show_screen("record")
+        self._reset_view("Recording started")
+
+    def go_home(self, _e=None):
+        if live.mode == "record" and not transcript.ended_at and transcript.count_lines():
+            self.toast("End the meeting first (End meeting, top right)")
+            return
+        self.show_screen("home")
+
+    def _end_btn_click(self, _e=None):
+        if transcript.ended_at:
+            self.go_home()
+        else:
+            self.end_meeting()
+
+    @staticmethod
+    def claude_connected():
+        return not live.released and (live.waiting or (
+            live.last_seen and time.time() - live.last_seen < PAUSED_AFTER_SECONDS))
+
+    def _copy_open_line(self, _e=None):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("open Sidenote")
+            self.toast("Copied “open Sidenote”: paste it into a Claude chat")
+        except Exception:
+            pass
+
+    def _card(self, parent, title, subtitle, command, accent=False):
+        border = tk.Frame(parent, bg=ACCENT if accent else LINE, padx=1, pady=1)
+        border.pack(fill="x", pady=(0, 10))
+        box = tk.Frame(border, bg=SURFACE, padx=14, pady=12, cursor="hand2")
+        box.pack(fill="x")
+        t = tk.Label(box, text=title, bg=SURFACE, fg=ACCENT if accent else FG, anchor="w",
+                     font=(FONT, 11, "bold"), cursor="hand2")
+        t.pack(fill="x")
+        sub = tk.Label(box, text=subtitle, bg=SURFACE, fg=MUTED, anchor="w", justify="left",
+                       font=(FONT, 9), cursor="hand2")
+        sub.pack(fill="x", pady=(2, 0))
+        for w in (box, t, sub):
+            w.bind("<Button-1>", lambda e: command())
+            w.bind("<Enter>", lambda e: [x.configure(bg=SURFACE_HI) for x in (box, t, sub)])
+            w.bind("<Leave>", lambda e: [x.configure(bg=SURFACE) for x in (box, t, sub)])
+        return sub
+
+    def _offline_row(self, parent):
+        """'Claude isn't connected' + a one-click copy of 'open Sidenote'."""
+        row = tk.Frame(parent, bg=BG)
+        tk.Label(row, text="Claude isn't connected. Paste this into a Claude chat:", bg=BG,
+                 fg=WARN, font=(FONT, 9), anchor="w").pack(side="left")
+        copy = tk.Label(row, text="Copy “open Sidenote”", bg=SURFACE, fg=FG,
+                        font=(FONT, 9, "bold"), padx=8, pady=2, cursor="hand2")
+        copy.pack(side="left", padx=(8, 0))
+        copy.bind("<Button-1>", self._copy_open_line)
+        self._hover(copy, SURFACE, SURFACE_HI)
+        return row
+
+    def _build_home(self):
+        self.home = tk.Frame(self.root, bg=BG)
+        inner = tk.Frame(self.home, bg=BG)
+        inner.pack(fill="both", expand=True, padx=20, pady=(28, 8))
+        tk.Label(inner, text="Sidenote", bg=BG, fg=FG, font=(FONT, 18, "bold"),
+                 anchor="w").pack(fill="x")
+        tk.Label(inner, text="Notes and answers for your meetings, with Claude.", bg=BG,
+                 fg=MUTED, font=(FONT, 9), anchor="w").pack(fill="x", pady=(2, 22))
+        self._card(inner, "●  Record a meeting",
+                   "Live captions, agenda, action items and answers during a call",
+                   self.start_recording, accent=True)
+        self.home_hist_sub = self._card(inner, "History", "Your saved meetings",
+                                        lambda: self.show_screen("history"))
+        self.home_offline = self._offline_row(inner)
+        self._home_offline_shown = False
+
+    def _home_refresh(self):
+        try:
+            entries = history_index()
+            opened = sum(_open_actions(e) for e in entries)
+            self.home_hist_sub.configure(
+                text=f"{len(entries)} saved meeting(s)"
+                     + (f" · {opened} open action item(s)" if opened else "")
+                     + " · browse and ask Claude about them")
+        except Exception as e:
+            log.info("History not readable: %s", e)
+
+    def _build_history(self):
+        self.hist = tk.Frame(self.root, bg=BG)
+        pad = 16
+        top = tk.Frame(self.hist, bg=BG)
+        top.pack(fill="x", padx=pad, pady=(14, 0))
+        back = tk.Label(top, text="← Home", bg=BG, fg=MUTED, cursor="hand2", font=(FONT, 9))
+        back.pack(side="left")
+        back.bind("<Button-1>", self.go_home)
+        self._hover(back, BG, BG, fg_on=FG, fg_off=MUTED)
+        tk.Label(top, text="History", bg=BG, fg=FG, font=(FONT, 13, "bold")).pack(
+            side="left", padx=(12, 0))
+        rec = tk.Label(top, text="● Record", bg=ACCENT, fg="#ffffff", cursor="hand2",
+                       font=(FONT, 9, "bold"), padx=10, pady=3)
+        rec.pack(side="right")
+        rec.bind("<Button-1>", lambda e: self.start_recording())
+        self._hover(rec, ACCENT, ACCENT_HI)
+
+        search = tk.Frame(self.hist, bg=SURFACE, highlightthickness=1, highlightbackground=LINE,
+                          highlightcolor=ACCENT)
+        search.pack(fill="x", padx=pad, pady=(10, 0))
+        self.h_search = tk.Entry(search, bg=SURFACE, fg=FG, insertbackground=FG, relief="flat",
+                                 font=(FONT, 10), borderwidth=0, highlightthickness=0)
+        self.h_search.pack(fill="x", padx=8, ipady=5)
+        self.h_search.bind("<KeyRelease>", lambda e: self._h_schedule())
+
+        filters = tk.Frame(self.hist, bg=BG)
+        filters.pack(fill="x", padx=pad, pady=(6, 0))
+        self.h_range = "all"
+        self.h_open_only = False
+        self.h_filter_labels = {}
+        for key, label in (("7", "Last 7 days"), ("30", "Last 30 days"), ("all", "All")):
+            lab = tk.Label(filters, text=label, bg=BG, fg=MUTED, font=(FONT, 8), padx=6, pady=2,
+                           cursor="hand2")
+            lab.pack(side="left", padx=(0, 4))
+            lab.bind("<Button-1>", lambda e, k=key: self._h_set_range(k))
+            self.h_filter_labels[key] = lab
+        self.h_open_lab = tk.Label(filters, text="☐ Open action items", bg=BG, fg=MUTED,
+                                   font=(FONT, 8), padx=6, pady=2, cursor="hand2")
+        self.h_open_lab.pack(side="right")
+        self.h_open_lab.bind("<Button-1>", lambda e: self._h_toggle_open())
+        self._h_paint_filters()
+
+        # chat (bottom): ask Claude about this meeting or all meetings
+        chat = tk.Frame(self.hist, bg=BG)
+        chat.pack(side="bottom", fill="x", padx=pad, pady=(6, 0))
+        head = tk.Frame(chat, bg=BG)
+        head.pack(fill="x")
+        tk.Label(head, text="Ask Claude about", bg=BG, fg=FG, font=(FONT, 9, "bold")).pack(
+            side="left")
+        self.h_scope_lab = tk.Label(head, text="", bg=BG, fg=ACCENT, cursor="hand2",
+                                    font=(FONT, 9, "underline"))
+        self.h_scope_lab.pack(side="left", padx=(6, 0))
+        self.h_scope_lab.bind("<Button-1>", lambda e: self._h_toggle_scope())
+        self.h_offline = self._offline_row(chat)
+        self._h_offline_shown = False
+        self.h_chat_text = tk.Text(chat, wrap="word", bg=SURFACE, fg=FG, relief="flat",
+                                   font=(FONT, 9), padx=10, pady=6, borderwidth=0,
+                                   highlightthickness=0, height=5, cursor="arrow",
+                                   spacing1=2, spacing3=3)
+        self.h_chat_text.pack(fill="x", pady=(4, 0))
+        for tag, opts in (("you", {"foreground": MUTED, "font": (FONT, 9, "bold")}),
+                          ("claude_name", {"foreground": ACCENT, "font": (FONT, 8, "bold")}),
+                          ("hint", {"foreground": FAINT}), ("note", {"foreground": WARN})):
+            self.h_chat_text.tag_configure(tag, **opts)
+        box = tk.Frame(chat, bg=SURFACE, highlightthickness=1, highlightbackground=LINE,
+                       highlightcolor=ACCENT)
+        box.pack(fill="x", pady=(6, 0))
+        self.h_entry = tk.Entry(box, bg=SURFACE, fg=FG, insertbackground=FG, relief="flat",
+                                font=(FONT, 10), borderwidth=0, highlightthickness=0)
+        self.h_entry.pack(side="left", fill="x", expand=True, padx=8, ipady=6)
+        self.h_entry.bind("<Return>", lambda e: self.history_ask())
+        ask = tk.Label(box, text="Ask", bg=ACCENT, fg="#ffffff", font=(FONT, 9, "bold"),
+                       padx=14, pady=5, cursor="hand2")
+        ask.pack(side="right", padx=4, pady=4)
+        ask.bind("<Button-1>", lambda e: self.history_ask())
+        self._hover(ask, ACCENT, ACCENT_HI)
+
+        body = tk.Frame(self.hist, bg=BG)
+        body.pack(fill="both", expand=True, padx=pad, pady=(8, 0))
+        self.h_text = tk.Text(body, wrap="word", bg=BG, fg=FG, relief="flat", font=(FONT, 9),
+                              padx=2, pady=4, borderwidth=0, highlightthickness=0,
+                              cursor="arrow", spacing1=2, spacing3=2)
+        self.h_text.pack(fill="both", expand=True)
+        t = self.h_text
+        t.tag_configure("title", font=(FONT, 10, "bold"), foreground=FG)
+        t.tag_configure("big", font=(FONT, 12, "bold"), foreground=FG, spacing3=2)
+        t.tag_configure("meta", foreground=FAINT, font=(FONT, 8))
+        t.tag_configure("muted", foreground=MUTED)
+        t.tag_configure("badge", foreground=ACCENT, font=(FONT, 8, "bold"))
+        t.tag_configure("section", foreground=FG, font=(FONT, 9, "bold"), spacing1=8)
+        t.tag_configure("link", foreground=ACCENT, underline=True)
+        t.tag_configure("check", foreground=OK)
+        t.tag_configure("box", foreground=MUTED)
+        t.tag_configure("done", foreground=FAINT, overstrike=True)
+        t.tag_configure("claude_badge", foreground=ACCENT_HI, font=(FONT, 8))
+        t.tag_configure("hover", background=SURFACE)
+        t.tag_configure("faint", foreground=FAINT)
+        t.configure(state="disabled")
+        self.h_selected = None           # meeting id open in detail view (None = list)
+        self.h_scope_all = True          # chat scope: all meetings / the selected one
+        self.h_show_transcript = False
+        self._h_chat = []                # [(who, text)] who: you, claude, note
+        self._h_waiting = False
+        self._h_job = None
+        self._h_entries = []
+        self._h_paint_scope()
+
+    # -- History: filters and list ---------------------------------------------------
+    def _h_paint_filters(self):
+        for key, lab in self.h_filter_labels.items():
+            on = key == self.h_range
+            lab.configure(bg=SURFACE_HI if on else BG, fg=FG if on else MUTED)
+        self.h_open_lab.configure(text=("☑" if self.h_open_only else "☐")
+                                  + " Open action items",
+                                  fg=FG if self.h_open_only else MUTED)
+
+    def _h_set_range(self, key):
+        self.h_range = key
+        self._h_paint_filters()
+        self.history_render()
+
+    def _h_toggle_open(self):
+        self.h_open_only = not self.h_open_only
+        self._h_paint_filters()
+        self.history_render()
+
+    def _h_schedule(self):
+        if self._h_job:
+            self.root.after_cancel(self._h_job)
+        self._h_job = self.root.after(250, self.history_render)
+
+    def _h_filtered(self):
+        text = self.h_search.get().strip()
+        since = ""
+        if self.h_range in ("7", "30"):
+            since = (datetime.date.today() - datetime.timedelta(days=int(self.h_range))).isoformat()
+        return [e for e in self._h_entries
+                if (not since or e["date"] >= since)
+                and (not self.h_open_only or _open_actions(e))
+                and (not text or _words_in(text, _meeting_text(e)))]
+
+    def history_render(self, reload=False):
+        if reload or not self._h_entries:
+            try:
+                self._h_entries = history_index()
+            except Exception as e:
+                log.info("History not readable: %s", e)
+                self._h_entries = []
+        if self.h_selected:
+            self._h_render_detail()
+        else:
+            self._h_render_list()
+        self._h_paint_scope()
+        self._h_render_chat()
+
+    def _h_link(self, tag, command):
+        t = self.h_text
+        t.tag_bind(tag, "<Button-1>", lambda e: command())
+        t.tag_bind(tag, "<Enter>", lambda e, g=tag: (t.configure(cursor="hand2"),
+                                                     t.tag_add("hover", f"{g}.first", f"{g}.last")))
+        t.tag_bind(tag, "<Leave>", lambda e: (t.configure(cursor="arrow"),
+                                              t.tag_remove("hover", "1.0", "end")))
+
+    def _h_render_list(self):
+        t = self.h_text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        rows = self._h_filtered()
+        if not self._h_entries:
+            t.insert("end", "No saved meetings yet. Record a meeting and it appears here.", "faint")
+        elif not rows:
+            t.insert("end", "No meetings match.", "faint")
+        for i, e in enumerate(rows):
+            tag = f"m{i}"
+            t.insert("end", f"{_day_label(e)}  {e['start']}\n", ("meta", tag))
+            t.insert("end", e["title"], ("title", tag))
+            n = _open_actions(e)
+            if n:
+                t.insert("end", f"   {n} open action item{'s' if n > 1 else ''}", ("badge", tag))
+            t.insert("end", "\n", (tag,))
+            if e["summary_line"]:
+                line = e["summary_line"]
+                t.insert("end", (line[:120] + "…" if len(line) > 120 else line) + "\n",
+                         ("muted", tag))
+            t.insert("end", "\n", (tag,))
+            self._h_link(tag, lambda m=e["id"]: self.history_open(m))
+        t.configure(state="disabled")
+
+    def history_open(self, meeting_id):
+        self.h_selected = meeting_id
+        self.h_scope_all = False
+        self.h_show_transcript = False
+        self.history_render()
+        self.h_text.yview_moveto(0)
+
+    def history_back(self):
+        self.h_selected = None
+        self.h_scope_all = True
+        self.history_render()
+
+    # -- History: one meeting ---------------------------------------------------------
+    def _h_render_detail(self):
+        t = self.h_text
+        e = next((x for x in self._h_entries if x["id"] == self.h_selected), None)
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("end", "← All meetings\n", ("link", "back"))
+        self._h_link("back", self.history_back)
+        if e is None:
+            t.insert("end", "\nThis meeting is no longer in the folder.", "faint")
+            t.configure(state="disabled")
+            return
+        try:
+            d = load_meeting(e["path"])
+        except Exception as ex:
+            t.insert("end", f"\nCould not read this meeting: {ex}", "faint")
+            t.configure(state="disabled")
+            return
+        t.insert("end", (d["title"] or "Untitled meeting") + "\n", "big")
+        meta = f"{_day_label(e)}, {d['start']}–{d['end']}"
+        if d["duration_min"]:
+            meta += f" ({d['duration_min']} min)"
+        t.insert("end", meta + "\n", "meta")
+        if d["participants"]:
+            t.insert("end", "With " + ", ".join(d["participants"]) + "\n", "muted")
+        if d["imported"]:
+            t.insert("end", "Imported from an older Sidenote file: some parts may be missing.\n",
+                     "meta")
+
+        def section(name):
+            t.insert("end", name + "\n", "section")
+        if d["summary"]:
+            section("Summary")
+            t.insert("end", d["summary"] + "\n")
+        if d["decisions"]:
+            section("Decisions")
+            for x in d["decisions"]:
+                t.insert("end", "• " + x["text"] + "\n")
+        if d["open_questions"]:
+            section("Open questions")
+            for x in d["open_questions"]:
+                answered = x.get("status") == "answered"
+                t.insert("end", "• " + x["text"] + "\n", "done" if answered else ())
+        section("Action items")
+        if not d["action_items"]:
+            t.insert("end", "None\n", "faint")
+        for a in d["action_items"]:
+            tag = f"act_{a['id']}"
+            done = a.get("status") == "done"
+            t.insert("end", "☑  " if done else "☐  ",
+                     ("check" if done else "box", tag))
+            t.insert("end", a["text"], ("done", tag) if done else (tag,))
+            meta = ", ".join(x for x in (a.get("owner") or "owner ?",
+                                          f"due {a['due']}" if a.get("due") else "") if x)
+            t.insert("end", f"   {meta}", ("meta", tag))
+            if done and a.get("closed_by") == "claude":
+                t.insert("end", "   closed by Claude", "claude_badge")
+                t.insert("end", " · ", "meta")
+                t.insert("end", "undo", ("link", tag + "_undo"))
+                self._h_link(tag + "_undo", lambda m=d["id"], i=a["id"]: self._h_set_action(m, i, "open"))
+            t.insert("end", "\n")
+            self._h_link(tag, lambda m=d["id"], i=a["id"], s=done:
+                         self._h_set_action(m, i, "open" if s else "done"))
+        if d["questions_to_ask"]:
+            section("Questions you saved to ask")
+            for q in d["questions_to_ask"]:
+                t.insert("end", ("☑  " if q.get("asked") else "☐  ") + q["text"] + "\n",
+                         "done" if q.get("asked") else ())
+        n = len(d["transcript"])
+        if n:
+            t.insert("end", "\n")
+            label = ("▾ Hide transcript" if self.h_show_transcript
+                     else f"▸ Show transcript ({n} lines)")
+            t.insert("end", label + "\n", ("link", "tr"))
+            self._h_link("tr", self._h_toggle_transcript)
+            if self.h_show_transcript:
+                for r in d["transcript"]:
+                    t.insert("end", f"{r['t'][:5]}  ", "meta")
+                    if r["speaker"]:
+                        t.insert("end", r["speaker"] + ": ", "muted")
+                    t.insert("end", r["text"] + "\n")
+        t.configure(state="disabled")
+
+    def _h_toggle_transcript(self):
+        self.h_show_transcript = not self.h_show_transcript
+        top = self.h_text.yview()[0]
+        self._h_render_detail()
+        self.h_text.yview_moveto(top)
+
+    def _h_set_action(self, meeting_id, item_id, status):
+        """Checkbox in History: writes straight to the meeting file (no Claude)."""
+        result = core_update_item(meeting_id, "action", item_id, status, by="user")
+        if not result.startswith("Updated"):
+            self.toast(result[:80])
+        top = self.h_text.yview()[0]
+        self.history_render(reload=True)
+        self.h_text.yview_moveto(top)
+
+    # -- History: chat with Claude -----------------------------------------------------
+    def _h_paint_scope(self):
+        if self.h_selected and not self.h_scope_all:
+            e = next((x for x in self._h_entries if x["id"] == self.h_selected), None)
+            name = e["title"] if e else "this meeting"
+            self.h_scope_lab.configure(text=f"this meeting ({name[:28]})  ⇄")
+        else:
+            self.h_scope_lab.configure(text="all meetings" + ("  ⇄" if self.h_selected else ""))
+
+    def _h_toggle_scope(self):
+        if self.h_selected:
+            self.h_scope_all = not self.h_scope_all
+            self._h_paint_scope()
+
+    def history_ask(self):
+        text = self.h_entry.get().strip()
+        if not text:
+            return
+        if not self.claude_connected():
+            self._h_chat.append(("note", "Claude isn't connected, so it can't answer yet. Copy "
+                                         "“open Sidenote” above into a Claude chat, "
+                                         "then ask again."))
+            self._h_render_chat()
+            return
+        self.h_entry.delete(0, "end")
+        scope = None if (self.h_scope_all or not self.h_selected) else self.h_selected
+        question_queue.put({"text": text, "scope": "history", "meeting_id": scope})
+        live.last_activity = time.time()
+        self._h_chat.append(("you", text))
+        self._h_waiting = True
+        self._h_render_chat()
+
+    def _h_render_chat(self):
+        t = self.h_chat_text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        if not self._h_chat:
+            t.insert("end", "Ask about one meeting or all of them, e.g. “What are my open "
+                            "action items from the last two weeks?”", "hint")
+        items = list(self._h_chat)
+        if self._h_waiting:
+            items.append(("hint", "Claude is thinking…"))
+        for who, text in reversed(items):            # newest on top
+            if who == "you":
+                t.insert("end", text + "\n", "you")
+            elif who == "claude":
+                t.insert("end", "Claude  ", "claude_name")
+                t.insert("end", text + "\n\n")
+            else:
+                t.insert("end", text + "\n", "note" if who == "note" else "hint")
+        t.configure(state="disabled")
+        t.yview_moveto(0)
+
+    def _offline_tick(self):
+        """Show the 'not connected' line on Home and History when Claude isn't there."""
+        offline = not self.claude_connected()
+        for row, attr in ((self.home_offline, "_home_offline_shown"),
+                          (self.h_offline, "_h_offline_shown")):
+            if offline != getattr(self, attr):
+                if offline:
+                    if row is self.h_offline:
+                        row.pack(fill="x", pady=(4, 0), before=self.h_chat_text)
+                    else:
+                        row.pack(fill="x", pady=(4, 0))
+                else:
+                    row.pack_forget()
+                setattr(self, attr, offline)
+
+    def go_history(self, _e=None):
+        if live.mode == "record" and not transcript.ended_at and transcript.count_lines():
+            self.toast("End the meeting first (End meeting, top right)")
+            return
+        self.show_screen("history")
 
     def toggle_captions(self):
         captions_win.hide_wanted = not captions_win.hide_wanted
@@ -5087,6 +6463,8 @@ class Overlay:
 
     def _captions_state(self):
         """Footer, right side: which transcript source is active and its health."""
+        if live.mode != "record":
+            return "Not recording", FAINT
         status, source = transcript.status, transcript.source
         if source in NAMED_SOURCES:
             if status.startswith(f"{source} captions connected"):
@@ -5130,6 +6508,21 @@ class Overlay:
                 if kind == "close":
                     self.root.destroy()
                     return
+                if kind == "record":
+                    self.start_recording(payload or {})
+                if kind == "history_answer":
+                    self._h_waiting = False
+                    self._h_chat.append(("claude", payload))
+                    self._h_render_chat()
+                if kind == "history_changed" and self.screen == "history":
+                    top = self.h_text.yview()[0]
+                    self.history_render(reload=True)
+                    self.h_text.yview_moveto(top)
+                if kind == "idle":
+                    self._h_chat.append(("note", "Claude stopped listening after 15 quiet "
+                                                 "minutes. Copy \u201copen Sidenote\u201d into a "
+                                                 "Claude chat to reconnect."))
+                    self._h_render_chat()
                 if kind == "new_meeting":
                     self._reset_view("New meeting started")
                 if kind == "info":
@@ -5183,6 +6576,7 @@ class Overlay:
             self._last_fit = time.time()
             self._fit_chips()
         try:
+            self._offline_tick()
             self._render_feed()
             self._update_name_bar()
         except Exception as e:
@@ -5516,7 +6910,6 @@ def main():
                 return
         open_request.clear()
         captions_win.hide_wanted = True
-        captions_win.ensure_running()    # open Live Captions if needed
         window_open.set()
         try:
             Overlay(server).run()       # returns when the window is closed

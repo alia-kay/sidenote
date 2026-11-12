@@ -33,6 +33,9 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
 
 6. Use it
    In a Claude chat, type: open Sidenote
+   The Sidenote window opens on its Home screen with two choices:
+   - Record a meeting: Sidenote starts reading captions (see below).
+   - History: your saved meetings (see step 9).
    - Google Meet (in Chrome): Sidenote turns on Meet's captions by itself
      (the CC button) and reads them, including your own voice. If captions
      don't come on within a few seconds, press CC yourself. If you turn
@@ -76,6 +79,27 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
      settled), Context links and the Transcript. It's written to be forwarded
      as is. Your typed questions and Claude's answers stay in the window and
      are not saved in the file.
+   - After the meeting, the button at the top right says "Home".
+
+9. History: your past meetings
+   - Open History from the Home screen (or ... > Meeting history). Search,
+     filter (last 7 / 30 days, open action items) and click a meeting to see
+     its summary, decisions, open questions and action items. The transcript
+     is folded away; click "Show transcript" to open it.
+   - Tick an action item to mark it done (untick to reopen). This works even
+     when Claude isn't connected.
+   - Ask Claude about one meeting or all of them in the box at the bottom, e.g.
+     "What are my open action items from the last two weeks?". Claude always
+     says which meeting and date an answer comes from.
+   - You can also ask in a normal Claude chat when the Sidenote window is
+     closed, e.g. "what did we decide about pricing?".
+   - Claude closes an action item only when you ask it to. Items it closed show
+     "closed by Claude", with an undo link.
+   - Click Record (top right) to start a meeting straight from History.
+   - Each meeting is saved twice in Documents/Sidenote: the readable .txt file
+     and a .meeting.json file with the same name (used by History). Meetings
+     saved by older versions are added to History automatically; their .txt
+     files are never changed.
 
 If macOS asks whether Claude may access your Documents folder, allow it.
 Everything stays on your computer except what you send to Claude.

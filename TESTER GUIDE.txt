@@ -1,5 +1,5 @@
 SIDENOTE - TESTER GUIDE (Mac)
-Version 2026-11-12 v9
+Version 2026-11-12 v10
 
 Sidenote is a small window that sits next to your meeting. It reads the
 meeting captions and lets you ask Claude about the meeting while it happens.
@@ -7,7 +7,7 @@ Meeting notes are saved only on your Mac, in Documents/Sidenote.
 
 You need: a Mac with the latest macOS, Google Chrome, the Claude desktop app
 (signed in), an internet connection, and the file
-Sidenote-2026-11-12-v9.mcpb.
+Sidenote-2026-11-12-v10.mcpb.
 
 
 BEFORE YOU START
@@ -18,7 +18,7 @@ BEFORE YOU START
 
 INSTALL
 
-2. Double-click Sidenote-2026-11-12-v9.mcpb. Claude opens and shows the
+2. Double-click Sidenote-2026-11-12-v10.mcpb. Claude opens and shows the
    Sidenote extension. Click Install.
    (Or open Claude > Settings > Extensions and drag the file into the window.)
 
@@ -54,7 +54,8 @@ FIRST START
 TRY IT IN A GOOGLE MEET CALL
 
 8. Join a Google Meet call in Chrome (a call with a friend or colleague,
-   or a test call on your own) and talk for a few minutes.
+   or a test call on your own). In the Sidenote window click "Record a
+   meeting", then talk for a few minutes.
    - Turn on captions in Meet (the CC button). Sidenote tries to turn them
      on by itself.
    - Ask Claude something in the box at the bottom of the Sidenote window,
@@ -112,11 +113,18 @@ TRY IT IN A GOOGLE MEET CALL
      nothing from other windows.
 
 
+8e. History:
+   - After a meeting or two, click "Home" (top right), then History. Open a
+     meeting, tick an action item, and ask in the box at the bottom: "What
+     are my open action items?". Then close the Sidenote window and ask the
+     same in a normal Claude chat.
+
+
 CHECK THE VERSION
 
 9. In the Claude chat, ask:
        What's Sidenote's status?
-   The answer ends with "Version: 2026-11-12 v9". The Sidenote window title
+   The answer ends with "Version: 2026-11-12 v10". The Sidenote window title
    shows the same version.
 
 

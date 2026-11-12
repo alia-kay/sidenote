@@ -4,7 +4,7 @@
   "name": "sidenote",
   "display_name": "Sidenote",
   "version": "7.0.0",
-  "description": "Live meeting assistant: reads your meeting captions and lets you ask Claude about the meeting while it happens.",
+  "description": "Live meeting assistant with a meeting history: reads your meeting captions, answers questions while it happens, and lets you ask Claude about past meetings.",
   "long_description": "Sidenote opens a small window next to your meeting. It reads the captions from Google Meet (with speaker names) or from your computer's Live Captions, keeps a transcript, an agenda, action items and questions to ask, and lets you ask Claude about the meeting at any moment. Meeting files are saved on your computer in Documents/Sidenote. Type 'open Sidenote' in a Claude chat to start.",
   "author": {
     "name": "alia-kay"
@@ -15,11 +15,16 @@
     "entry_point": "sidenote.py",
     "mcp_config": {
       "command": "uv",
-      "args": ["run", "--frozen", "--directory", "${__dirname}", "sidenote.py"],
+      "args": [
+        "run",
+        "--frozen",
+        "--directory",
+        "${__dirname}",
+        "sidenote.py"
+      ],
       "env": {
         "UV_PYTHON_PREFERENCE": "only-managed"
-      }
-    }
+      }}
   },
   "tools": [
     {"name": "open_sidenote", "description": "Show the Sidenote window and start reading meeting captions."},
@@ -42,14 +47,27 @@
     {"name": "get_full_transcript", "description": "Return the meeting info and the whole transcript."},
     {"name": "show_suggestion", "description": "Show a short answer in the Sidenote window."},
     {"name": "start_new_meeting", "description": "Save the current meeting and start a new one."},
+    {"name": "list_meetings", "description": "List saved meetings (works when the window is closed)."},
+    {"name": "get_meeting", "description": "One saved meeting: recap, decisions, questions, action items."},
+    {"name": "find_items", "description": "Search action items, decisions and questions across meetings."},
+    {"name": "search_transcripts", "description": "Search what was said in saved meetings (snippets)."},
+    {"name": "update_item", "description": "Change the status of a saved item (only when the user asks)."},
     {"name": "get_status", "description": "Show Sidenote's version, caption connection and where the meeting file is saved."}
   ],
   "compatibility": {
-    "platforms": ["darwin", "win32"],
+    "platforms": [
+      "darwin",
+      "win32"
+    ],
     "runtimes": {
-      "python": ">=3.10"
-    }
+      "python": ">=3.10"}
   },
-  "keywords": ["meetings", "captions", "transcript", "google meet", "notes"],
+  "keywords": [
+    "meetings",
+    "captions",
+    "transcript",
+    "google meet",
+    "notes"
+  ],
   "license": "UNLICENSED"
 }

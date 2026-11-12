@@ -38,7 +38,7 @@ PACKAGE_FILES = {
     ".python-version": os.path.join(EXT, ".python-version"),
 }
 FORBIDDEN = b"co" + b"pilot"          # spelled in two parts so this file passes too
-EXPECTED_TOOLS = 21
+EXPECTED_TOOLS = 26
 
 
 def fail(msg):

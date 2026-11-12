@@ -76,11 +76,19 @@ How it works: Sidenote is a local MCP server for the Claude desktop app, on Wind
 
 ## Saved files
 
-- Each meeting is saved automatically as a text file in Documents/Sidenote. The file holds the meeting info, a timestamped transcript, your questions and Claude's answers, the lists, the recap, and an end marker.
+- Each meeting is saved automatically in Documents/Sidenote as a readable text file and, next to it, a <same name>.meeting.json (schema_version 1): meeting info, summary, by person, decisions, open questions, action items (id, owner, real due date, status, where they came from, who closed them and why), questions to ask, context and the transcript with timestamps. One self-contained file per meeting; a small cache (.sidenote_index.json) keeps History fast and is rebuilt automatically.
+- Meetings saved before v10 are imported once (best effort, marked imported); their .txt files are never changed. Installing or updating Sidenote never writes to or deletes anything in Documents/Sidenote.
+
+## Home and History
+
+- "open Sidenote" opens the window on Home: Record a meeting, or History. Captions are read only while recording.
+- History: meetings by date with search and filters, a detail view (summary, decisions, open questions, action items with checkboxes, transcript folded), and a chat to ask Claude about one meeting or all of them. Works without Claude for browsing and ticking; says so plainly (with a copyable "open Sidenote") when Claude isn't connected.
+- Claude answers past-meeting questions with list_meetings, find_items, get_meeting and search_transcripts, always naming the source meeting and date. It closes action items only on the user's explicit request (stored as closed by Claude, with the request as evidence, undoable).
+- On Home/History Claude listens in longer intervals and stops (IDLE) after 15 quiet minutes.
 
 ## Tools Claude can use (MCP)
 
-open_sidenote, close_sidenote, wait_for_question, show_suggestion, update_meeting_info, add_agenda_items, add_participants, add_action_item, add_questions_to_ask, mark_done, set_context_sources, add_context_item, save_recap, get_recent_transcript, get_full_transcript, get_meeting_context, start_new_meeting, get_status (shows the source, line count, auto-captions activity and version), debug_meet_tree, debug_live_captions_tree.
+open_sidenote, close_sidenote, wait_for_question, show_suggestion, update_meeting_info, add_agenda_items, add_participants, add_action_item, add_questions_to_ask, mark_done, set_context_sources, add_context_item, save_recap, get_recent_transcript, get_full_transcript, get_meeting_context, start_new_meeting, get_status (shows the source, line count, auto-captions activity and version), list_meetings, get_meeting, find_items, search_transcripts, update_item, debug_meet_tree, debug_call_window, debug_live_captions_tree.
 
 ## Technical notes
 
