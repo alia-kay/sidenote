@@ -5400,6 +5400,8 @@ class Overlay:
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         w = max(400, min(int(sw * (0.38 if IS_MAC else 0.30)), 740))
         h = max(520, min(int(sh * (0.82 if IS_MAC else 0.78)), 1100))
+        self._default_w = w
+        self._tab_w = {"live": None, "meetings": None}   # each tab's own width
         geometry = self._saved_geometry(sw, sh) or f"{w}x{h}+40+40"
         self.root.geometry(geometry)
         self._opened_at = time.time()
@@ -5643,6 +5645,14 @@ class Overlay:
             with open(self.GEOMETRY_FILE) as f:
                 g = json.load(f)
             w, h, x, y = int(g["w"]), int(g["h"]), int(g["x"]), int(g["y"])
+            wm = g.get("w_meetings")
+            if wm is None and w >= px(self.MEETINGS_MIN_WIDTH):
+                # saved by an older Sidenote while on Past meetings: that width
+                # isn't the New meeting width
+                wm, w = w, self._default_w
+            if wm and 300 <= int(wm) <= sw:
+                self._tab_w["meetings"] = int(wm)
+            self._tab_w["live"] = w
             if 300 <= w <= sw and 360 <= h <= sh and -50 <= x < sw - 100 and -50 <= y < sh - 100:
                 return f"{w}x{h}+{x}+{y}"
         except Exception:
@@ -5675,6 +5685,12 @@ class Overlay:
                  "x": self.root.winfo_x(), "y": self.root.winfo_y()}
             if g["w"] < 300 or g["h"] < 360:
                 return
+            # each tab keeps its own width; "w" is the New meeting tab
+            tab = "meetings" if getattr(self, "screen", None) == "meetings" else "live"
+            self._tab_w[tab] = g["w"]
+            g["w"] = self._tab_w["live"] or g["w"]
+            if self._tab_w["meetings"]:
+                g["w_meetings"] = self._tab_w["meetings"]
             os.makedirs(SAVE_DIR, exist_ok=True)
             with open(self.GEOMETRY_FILE, "w") as f:
                 json.dump(g, f)
@@ -6342,39 +6358,40 @@ class Overlay:
             if not recording:
                 live.mode = "history"
         prev = getattr(self, "screen", None)
+        if prev and prev != name:
+            self._resize_for_tab(prev, name)
         self.screen = name
         self.tab_live.set(selected=name == "live")
         self.tab_past.set(selected=name == "meetings")
         live.last_activity = time.time()
         if name == "meetings":
-            self._widen()
             self.history_render(reload=True)
-        elif prev == "meetings":
-            self._narrow()
         self.update_info()
 
-    def _widen(self):
+    def _resize_for_tab(self, prev, name):
+        """Each tab keeps its own width: Past meetings is wide (side list), the
+        New meeting tab narrow. A width you set by hand is remembered per tab."""
         self.root.update_idletasks()
+        try:
+            if self.root.state() == "zoomed":
+                return                               # maximized: leave it
+        except Exception:
+            pass
         w, h = self.root.winfo_width(), self.root.winfo_height()
-        if w >= px(self.MEETINGS_MIN_WIDTH):
-            self._narrow_to = None
-            return
         x, y = self.root.winfo_x(), self.root.winfo_y()
-        new_w = px(self.MEETINGS_MIN_WIDTH)
-        x = max(0, min(x, self.root.winfo_screenwidth() - new_w - 10))
-        self._narrow_to = (w, self.root.winfo_x())
-        self.root.geometry(f"{new_w}x{h}+{x}+{y}")
-
-    def _narrow(self):
-        back = getattr(self, "_narrow_to", None)
-        self._narrow_to = None
-        if not back:
-            return
-        self.root.update_idletasks()
-        if abs(self.root.winfo_width() - px(self.MEETINGS_MIN_WIDTH)) > px(4):
-            return                                   # the user resized it: leave it
-        w, x = back
-        self.root.geometry(f"{w}x{self.root.winfo_height()}+{x}+{self.root.winfo_y()}")
+        self._tab_w[prev] = w
+        if name == "meetings":
+            new_w = self._tab_w["meetings"] or max(w, px(self.MEETINGS_MIN_WIDTH))
+            self._tab_x = x                          # to go back to the same place
+        else:
+            new_w = self._tab_w["live"] or self._default_w
+            x = getattr(self, "_tab_x", None)
+            x = self.root.winfo_x() if x is None else x
+            self._tab_x = None
+        new_w = min(new_w, self.root.winfo_screenwidth())
+        x = max(0, min(x, self.root.winfo_screenwidth() - new_w))
+        if new_w != w or x != self.root.winfo_x():
+            self.root.geometry(f"{new_w}x{h}+{x}+{y}")
 
     # ---- ＋ tab when nothing is recording -------------------------------------------
     def _build_start(self):
