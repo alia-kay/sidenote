@@ -71,6 +71,8 @@ STALE_SECONDS = 600             # ...10 min = old caption text read again: skip 
 REVISION_MIN_WORDS = 6          # a 6+ word line that is...
 REVISION_SIMILARITY = 0.8       # ...80% the same as one from the last...
 REVISION_SECONDS = 20           # ...20 s is a corrected re-send: replace that line
+REPLAY_MIN_WORDS = 6            # a 6+ word line already captured this meeting = replay
+REPLAY_RUN_SECONDS = 5          # shorter repeats count as replay this soon after one
 NOTE_PREFIXES = ("YOU ASKED:", "CLAUDE:", "MEETING ENDED")   # transcript lines nobody said
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -126,8 +128,234 @@ def parse_list(value):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Profile: what the user told us once (kept across meetings, never asked twice)
+# ---------------------------------------------------------------------------
+PROFILE_FILE = os.path.join(SAVE_DIR, "profile.json")
+NAME_RANK = {"claude": 1, "meet": 2, "typed": 3}   # a better source may replace a name
+
+
+class Profile:
+    """Documents/Sidenote/profile.json: the user's name and role. Goals stay per
+    meeting. Prepared for more fields later (e.g. a calendar account)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.data = {"name": "", "name_source": "", "role": "", "name_asked": False}
+        try:
+            import json
+            with open(PROFILE_FILE, encoding="utf-8") as f:
+                self.data.update({k: v for k, v in json.load(f).items() if k in self.data})
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            import json
+            os.makedirs(SAVE_DIR, exist_ok=True)
+            tmp = PROFILE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, PROFILE_FILE)
+        except OSError as e:
+            log.warning("Could not save profile: %s", e)
+
+    @property
+    def name(self):
+        return self.data["name"]
+
+    @property
+    def role(self):
+        return self.data["role"]
+
+    def set_role(self, role):
+        role = (role or "").strip()
+        with self.lock:
+            if role != self.data["role"]:
+                self.data["role"] = role
+                self._save()
+
+    def set_name(self, name, source):
+        """Save the user's name unless a more reliable source already set it.
+        Returns True if the name changed. An empty typed name clears it."""
+        name = " ".join(str(name or "").split()).strip(" .,:;")
+        if name.lower() in SELF_WORDS | TEAM_WORDS | UNKNOWN_WORDS:
+            name = ""
+        with self.lock:
+            if not name:
+                if source == "typed" and self.data["name"]:
+                    self.data.update(name="", name_source="")
+                    self._save()
+                    return True
+                return False
+            if name == self.data["name"]:
+                return False
+            if self.data["name"] and \
+                    NAME_RANK.get(source, 0) < NAME_RANK.get(self.data["name_source"], 0):
+                return False
+            self.data.update(name=name, name_source=source)
+            self._save()
+        log.info("User's name set from %s", source)
+        return True
+
+    def mark_asked(self):
+        with self.lock:
+            if not self.data["name_asked"]:
+                self.data["name_asked"] = True
+                self._save()
+
+
+# The user's own display name in Google Meet, when a label shows it
+# ("Iman Kay (You)" in the people list, "Google Account: Iman Kay (...)").
+MEET_SELF_LABELS = (re.compile(r"^(.{2,40}?)\s*\((?:You|you)\)$"),
+                    re.compile(r"^Google Account:\s*([^(\n]{2,40}?)\s*(?:\(|$)"))
+
+
+def note_meet_label(label):
+    """Called for each element while a Meet reader walks the window (best effort)."""
+    if not label or profile.data["name_source"] in ("typed", "meet") or len(label) > 120:
+        return
+    for pattern in MEET_SELF_LABELS:
+        m = pattern.match(label)
+        if m and "@" not in m.group(1):
+            set_user_name(m.group(1), "meet")
+            return
+
+
+def os_full_name():
+    """The account's full name, only as a pre-filled guess for the name question."""
+    try:
+        if IS_MAC:
+            import subprocess
+            return subprocess.run(["id", "-F"], capture_output=True, text=True,
+                                  timeout=2).stdout.strip()
+        import ctypes
+        size = ctypes.c_ulong(0)
+        ctypes.windll.secur32.GetUserNameExW(3, None, ctypes.byref(size))   # 3 = display name
+        buf = ctypes.create_unicode_buffer(size.value or 256)
+        if ctypes.windll.secur32.GetUserNameExW(3, buf, ctypes.byref(size)):
+            return buf.value.strip()
+    except Exception:
+        pass
+    return ""
+
+
+# Owners are always names: "you"/"me" become the user's name, team-wide items
+# become "Team", and "someone" means unknown (shown as "Owner: ?").
+SELF_WORDS = {"you", "me", "i", "myself", "yourself", "user", "the user", "my", "mine"}
+TEAM_WORDS = {"team", "the team", "everyone", "everybody", "all", "we", "us",
+              "all of us", "whole team", "the whole team", "both"}
+UNKNOWN_WORDS = {"someone", "somebody", "anyone", "anybody", "tbd", "unknown", "?",
+                 "n/a", "na", "none", "unassigned", "owner"}
+SELF = "@me"          # stored owner for the user while their name is unknown
+
+# Finding a task's owner in the transcript (Transcript.guess_owner)
+OWNER_STOPWORDS = {
+    "the", "and", "for", "you", "can", "will", "with", "this", "that", "please", "could",
+    "would", "okay", "ok", "so", "yeah", "right", "hey", "hi", "alright", "also", "then",
+    "now", "well", "yes", "no", "maybe", "just", "let", "need", "needs", "should", "have",
+    "has", "our", "your", "their", "from", "into", "about", "what", "when", "who", "how",
+    "why", "there", "here", "all", "are", "was", "were", "its", "it's", "we", "they",
+    "them", "him", "her", "his", "she", "he", "i'll", "me", "my", "make", "sure", "do",
+    "does", "did", "get", "got", "and", "but", "if", "or", "guys", "everyone", "team"}
+# "Leon, can you check staging" / "Leon can you..."  (names are capitalized)
+ADDRESSED = re.compile(r"(?:^|[.!?]\s+)(?:(?:[Oo]k(?:ay)?|[Ss]o|[Aa]nd|[Hh]ey|[Hh]i|[Rr]ight|"
+                       r"[Yy]eah|[Aa]lright)[, ]+)?([A-Z][a-zA-Z'\-]{1,20}),?\s+"
+                       r"(?:can|could|would|will|please|do)\s+you\b")
+# "Can you check staging, Leon?"
+ADDRESSED_END = re.compile(r"\b(?:[Cc]an|[Cc]ould|[Ww]ould|[Ww]ill) you\b[^.?!]*,\s*"
+                           r"([A-Z][a-zA-Z'\-]{1,20})\s*[?.!]*\s*$")
+# "I'll check staging" / "Let me take that" (the speaker owns it)
+COMMITMENT = re.compile(r"\b(?:i'll|i will|i can|i'm going to|i am going to|let me|"
+                        r"i'll take|i can take|leave it with me)\b", re.I)
+
+
+def normalize_owner(owner):
+    o = " ".join(str(owner or "").split()).strip(" .,:;")
+    low = o.lower().rstrip("?").strip()
+    if low in SELF_WORDS:
+        return profile.name or SELF
+    if low in TEAM_WORDS:
+        return "Team"
+    if low in UNKNOWN_WORDS or not low:
+        return ""
+    if profile.name and low == profile.name.lower():
+        return profile.name
+    return o
+
+
+def owner_text(owner):
+    """Owner as shown/saved: a name, or '' when unknown."""
+    if owner == SELF:
+        return profile.name or ""
+    return owner
+
+
+def speaker_name(label):
+    """Transcript speaker label with the user's own 'You' replaced by their name."""
+    if label in ("You", "you", "Me") and profile.name:
+        return profile.name
+    return label
+
+
+def display_line(line):
+    """A transcript line with 'You: ...' shown as '<name>: ...'."""
+    if profile.name and line.startswith(("You: ", "Me: ")):
+        return profile.name + line[line.index(":"):]
+    return line
+
+
+# Real dates instead of "today" / "tomorrow" in what is saved
+WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday",
+                 "saturday", "sunday"]
+
+
+def fmt_day(d):
+    """'Mon 9 Nov' (portable: no %-d)."""
+    return f"{d:%a} {d.day} {d:%b}"
+
+
+def real_dates(text, base, due=False):
+    """Replace relative days with real dates, counted from the meeting's date.
+    Free text: today, tonight, tomorrow, yesterday. Due dates (due=True) also:
+    weekdays ('Friday', 'this Friday'), 'end of week', 'next week', 'end of
+    month'. 'Next Friday' is left as said (it is ambiguous)."""
+    if not text:
+        return text
+    if isinstance(base, datetime.datetime):
+        base = base.date()
+    one = datetime.timedelta(days=1)
+    rules = [
+        (r"\bday after tomorrow\b", lambda m: fmt_day(base + 2 * one)),
+        (r"\b(?:today|tonight|this (?:morning|afternoon|evening))\b",
+         lambda m: fmt_day(base)),
+        (r"\btomorrow\b", lambda m: fmt_day(base + one)),
+        (r"\byesterday\b", lambda m: fmt_day(base - one)),
+    ]
+    if due:
+        def weekday(m):
+            target = WEEKDAY_NAMES.index(m.group(1).lower())
+            return fmt_day(base + ((target - base.weekday()) % 7) * one)
+        friday = base + ((4 - base.weekday()) % 7) * one
+        monday = base + (7 - base.weekday()) * one
+        nxt = (base.replace(day=28) + 4 * one).replace(day=1)
+        rules += [
+            (r"\b(?:the )?end of (?:the |this )?week\b", lambda m: fmt_day(friday)),
+            (r"\bnext week\b", lambda m: "week of " + fmt_day(monday)),
+            (r"\b(?:the )?end of (?:the |this )?month\b", lambda m: fmt_day(nxt - one)),
+            (r"(?<!next )\b(?:this |on |by )?(" + "|".join(WEEKDAY_NAMES) + r")\b", weekday),
+            (r"^\s*(?:eod|end of (?:the )?day)\s*$", lambda m: fmt_day(base) + " EOD"),
+        ]
+    for pattern, repl in rules:
+        text = re.sub(pattern, repl, text, flags=re.I)
+    return text
+
+
 EMPTY_CONTEXT = {"title": "", "subject": "", "role": "", "goals": "",
                  "participants": [], "agenda": [], "recap": "",
+                 "by_person": "",    # recap: one block per person
+                 "decisions": "",    # recap: decisions made
+                 "open_debates": "", # recap: open questions and unresolved debates
                  "agenda_done": [],  # agenda items already covered (their text)
                  "actions": [],      # [{"text", "owner", "due", "done"}]
                  "questions": [],    # [{"text", "done"}]
@@ -158,6 +386,11 @@ class Transcript:
     def _reset(self):
         self.context = {k: (list(v) if isinstance(v, list) else v)
                         for k, v in EMPTY_CONTEXT.items()}
+        self.context["role"] = profile.role   # the role carries over between meetings
+        self.speakers = []                # names heard in Meet captions (not 'You')
+        self.captured = set()             # (speaker, words) of every line this meeting
+        self.replay_skipped = 0           # lines skipped because captions replayed them
+        self._replay_at = None            # last time a replayed line was skipped
         self.ended_at = None              # set when the user ends the meeting
         self.cue_at = 0.0                 # last time a cue phrase was said
         self.others_recent = deque(maxlen=40)   # (time, key) of recent 'Others' lines
@@ -200,6 +433,8 @@ class Transcript:
                              ("goals", goals), ("recap", recap)):
                 if val is not None and str(val).strip():
                     c[key] = str(val).strip()
+            if role is not None and str(role).strip():
+                profile.set_role(role)        # remembered for the next meetings
             if participants is not None and parse_list(participants):
                 c["participants"] = parse_list(participants)
             if agenda is not None and parse_list(agenda):
@@ -231,21 +466,96 @@ class Transcript:
         return new
 
     def add_action(self, text, owner="", due=""):
+        """Save an action item. The owner is always a name (see normalize_owner);
+        when none is given, Sidenote looks for one in the transcript, and marks
+        a weak guess as unsure ('Leon?'). Relative due dates become real dates."""
         text = text.strip()
         if not text:
             return False
+        owner, sure = normalize_owner(owner), True
+        if not owner:
+            owner, sure = self.guess_owner(text)
+        due = real_dates(due.strip(), self.started, due=True)
         with self.lock:
             for a in self.context["actions"]:
                 if _same(a["text"], text):
-                    if owner and not a["owner"]:
-                        a["owner"] = owner.strip()
+                    if owner and (not a["owner"] or not a.get("sure", True)) and sure:
+                        a["owner"], a["sure"] = owner, True
                     if due and not a["due"]:
-                        a["due"] = due.strip()
+                        a["due"] = due
+                    self.dirty = True
                     return False
-            self.context["actions"].append({"text": text, "owner": owner.strip(),
-                                            "due": due.strip(), "done": False})
+            self.context["actions"].append({"text": text, "owner": owner, "sure": sure,
+                                            "due": due, "done": False})
             self.dirty = True
         return True
+
+    def set_owner(self, index, owner):
+        """The user picked an owner in the window."""
+        with self.lock:
+            items = self.context["actions"]
+            if not 0 <= index < len(items):
+                return False
+            items[index]["owner"] = normalize_owner(owner)
+            items[index]["sure"] = True
+            self.dirty = True
+        return True
+
+    def apply_user_name(self):
+        """The user's name became known: fill it in where we had to wait for it."""
+        if not profile.name:
+            return
+        with self.lock:
+            for a in self.context["actions"]:
+                if a["owner"] == SELF:
+                    a["owner"] = profile.name
+            self.dirty = True
+
+    def people(self):
+        """Everyone in the meeting: participants, names heard in Meet, and the
+        user (by name). Used for the owner picker and the recap's BY PERSON."""
+        out = []
+        for name in ([profile.name] if profile.name else []) + \
+                list(self.context["participants"]) + list(self.speakers):
+            name = speaker_name(name)
+            if name and name not in ("Others", "You") and \
+                    not any(name.lower() == n.lower() for n in out):
+                out.append(name)
+        return out
+
+    def guess_owner(self, task):
+        """Find who owns a task from the transcript, in this order: the speaker
+        who committed ('I'll do X'), the person addressed ('Leon, can you...'),
+        a known person named in that line (unsure). Returns (owner, sure)."""
+        words = {w for w in re.findall(r"[a-z0-9']+", task.lower())
+                 if len(w) > 2 and w not in OWNER_STOPWORDS}
+        if not words:
+            return "", True
+        with self.lock:
+            lines = [s for _, s in self.entries[-80:] if not s.startswith(NOTE_PREFIXES)]
+            people = [p for p in self.people()]
+        best, best_score = None, 0
+        for line in lines:                       # latest best match wins
+            spoken = set(re.findall(r"[a-z0-9']+", line.lower()))
+            score = len(words & spoken)
+            if score >= min(2, len(words)) and score >= best_score:
+                best, best_score = line, score
+        if not best:
+            return "", True
+        speaker, sep, said = best.partition(": ")
+        if not sep or len(speaker) > 40:
+            speaker, said = "", best
+        speaker = speaker_name(speaker)
+        m = ADDRESSED.search(said) or ADDRESSED_END.search(said)
+        if m and m.group(1).lower() not in OWNER_STOPWORDS:
+            return m.group(1), True
+        if COMMITMENT.search(said) and speaker and speaker != "Others":
+            return normalize_owner(speaker if speaker not in ("You", "Me") else "me"), True
+        for person in people:
+            first = person.split()[0]
+            if re.search(r"\b" + re.escape(first) + r"\b", said, re.I):
+                return person, False
+        return "", True
 
     def add_question(self, text):
         text = text.strip()
@@ -343,6 +653,7 @@ class Transcript:
                 candidates = finals
 
             now = datetime.datetime.now()
+            self._check_batch(now, speaker, candidates)
             for sentence in candidates:
                 key = norm(sentence)
                 if not key or key in self.recent:
@@ -417,6 +728,40 @@ class Transcript:
                 return rec
         return None
 
+    def _is_replay(self, now, speaker, words):
+        """Live Captions sometimes re-sends the whole conversation (thousands of
+        lines). A line of REPLAY_MIN_WORDS+ words already captured this meeting
+        is a replay; a shorter one is too while a replay is going on (seconds
+        after another replayed line). Logged once per meeting."""
+        if not words or (speaker, words) not in self.captured:
+            return False
+        replaying = self._replay_at is not None and \
+            (now - self._replay_at).total_seconds() <= REPLAY_RUN_SECONDS
+        if len(words) < REPLAY_MIN_WORDS and not replaying:
+            return False
+        if self.replay_skipped == 0:
+            log.info("Captions replayed earlier lines: skipping them")
+        self.replay_skipped += 1
+        self._replay_at = now
+        return True
+
+    def _check_batch(self, now, speaker, sentences):
+        """A batch of new caption lines that is mostly lines we already have is a
+        replay as a whole, so its short lines ('Okay.', 'Hi.') are skipped too."""
+        sigs = [(speaker, tuple(re.findall(r"\w+", s.lower()))) for s in sentences]
+        sigs = [s for s in sigs if s[1]]
+        seen = sum(1 for s in sigs if s in self.captured)
+        if seen >= 3 and seen * 2 >= len(sigs):
+            self._replay_at = now
+
+    def _remember(self, speaker, words):
+        """Note a captured line for replay detection, and who spoke (Meet names)."""
+        if words:
+            self.captured.add((speaker, words))
+        if speaker and speaker not in ("Others", "You", "Me") and \
+                speaker not in self.speakers and len(self.speakers) < 50:
+            self.speakers.append(speaker)
+
     def _commit(self, now, line, key, speaker=""):
         """Add a finished sentence. If captions extended the previous sentence
         ('I added' -> 'I added X to the agenda') or corrected a recent one ('fit
@@ -425,9 +770,10 @@ class Transcript:
         again from the captions buffer are skipped."""
         sentence = line[len(speaker) + 2:] if speaker else line
         words = tuple(re.findall(r"\w+", sentence.lower()))
-        if self._is_repeat(now, speaker, words):
+        if self._is_repeat(now, speaker, words) or self._is_replay(now, speaker, words):
             self.recent.append(key)
             return False
+        self._remember(speaker, words)
         rec = self._find_revision(now, speaker, words)
         if rec is not None and rec[3] < len(self.entries):
             idx = rec[3]
@@ -516,50 +862,50 @@ class Transcript:
         return path
 
     def _render(self):
+        """The meeting file, written to be read later by other people: real names
+        (never 'You'), real dates, and each list exactly once. Typed questions
+        and Claude's live answers stay in the window, not in the file."""
         c = self.context
         end = self.ended_at or datetime.datetime.now()
-        bullets = lambda items: "\n".join(f"- {i}" for i in items)
+        day = self.started.date()
+        me = profile.name
+        when = lambda text: real_dates(text, day)
+        section = lambda title, body: [title, body.strip() if body else "", ""]
+        owner = lambda a: owner_text(a["owner"]) + ("?" if a["owner"] and not a.get("sure", True) else "")
+        actions = []
+        for a in c["actions"]:
+            who = owner(a) or "owner: ?"
+            due = f", due {when(a['due'])}" if a["due"] else ""
+            actions.append(f"- [{'x' if a['done'] else ' '}] {when(a['text'])} ({who}{due})")
+        open_q = [when(line) for line in c["open_debates"].splitlines() if line.strip()]
+        open_q += [f"- [ ] {when(q['text'])}" for q in c["questions"] if not q["done"]]
+        people = self.people()
         lines = [
-            f"MEETING: {c['title']}",
-            f"Subject: {c['subject']}",
-            f"Date: {self.started.strftime('%Y-%m-%d')}, "
-            f"{self.started.strftime('%H:%M')} - {end.strftime('%H:%M')}",
-            "",
-            "AGENDA",
-            "\n".join(f"- [{'x' if a in c['agenda_done'] else ' '}] {a}" for a in c["agenda"]),
-            "",
-            "PARTICIPANTS",
-            bullets(c["participants"]),
-            "",
-            "MY ROLE",
-            c["role"],
-            "",
-            "MY GOALS",
-            c["goals"],
-            "",
-            "QUICK RECAP",
-            c["recap"],
-            "",
-            "ACTION ITEMS",
-            "\n".join(
-                f"- [{'x' if a['done'] else ' '}] {a['text']}"
-                + (f" (owner: {a['owner']})" if a["owner"] else "")
-                + (f" (due: {a['due']})" if a["due"] else "")
-                for a in c["actions"]),
-            "",
-            "CONTEXT (Jira / Confluence)",
-            "\n".join(f"- {x['title']}" + (f" ({x['source']})" if x["source"] else "")
-                      + (f": {x['detail']}" if x["detail"] else "")
-                      + (f" {x['url']}" if x["url"] else "") for x in c["context"]),
-            "",
-            "QUESTIONS TO ASK",
-            "\n".join(f"- [{'x' if q['done'] else ' '}] {q['text']}"
-                      + (" (asked)" if q["done"] else "") for q in c["questions"]),
-            "",
-            "FULL TRANSCRIPT",
-            "(Questions typed in Sidenote are marked YOU ASKED, answers are marked CLAUDE.)",
+            f"MEETING: {c['title'] or c['subject']}",
+            f"Date: {self.started:%a} {day.day} {self.started:%b %Y}, "
+            f"{self.started:%H:%M} - {end:%H:%M}",
+            f"Participants: {', '.join(people)}",
         ]
-        lines += [f"[{t.strftime('%H:%M:%S')}] {s}" for t, s in self.entries]
+        if c["agenda"]:
+            lines += ["Agenda:"] + [f"- [{'x' if a in c['agenda_done'] else ' '}] {a}"
+                                    for a in c["agenda"]]
+        if c["role"]:
+            lines.append(f"{me + chr(39) + 's' if me else 'My'} role: {c['role']}")
+        if c["goals"]:
+            lines.append(f"{me + chr(39) + 's' if me else 'My'} goals: {c['goals']}")
+        lines.append("")
+        lines += section("SUMMARY", when(c["recap"]))
+        lines += section("BY PERSON", when(c["by_person"]))
+        lines += section("DECISIONS", when(c["decisions"]))
+        lines += section("ACTION ITEMS", "\n".join(actions))
+        lines += section("OPEN QUESTIONS", "\n".join(open_q))
+        lines += section("CONTEXT", "\n".join(
+            f"- {x['title']}" + (f" ({x['source']})" if x["source"] else "")
+            + (f": {x['detail']}" if x["detail"] else "")
+            + (f" {x['url']}" if x["url"] else "") for x in c["context"]))
+        lines.append("TRANSCRIPT")
+        lines += [f"[{t.strftime('%H:%M:%S')}] {display_line(s)}" for t, s in self.entries
+                  if not s.startswith(("YOU ASKED:", "CLAUDE:"))]
         return "\n".join(lines) + "\n"
 
     def save_now(self):
@@ -591,9 +937,9 @@ class Transcript:
 
     # --- reading -----------------------------------------------------------
     def _format(self, items):
-        lines = [f"[{t.strftime('%H:%M:%S')}] {s}" for t, s in items]
+        lines = [f"[{t.strftime('%H:%M:%S')}] {display_line(s)}" for t, s in items]
         if self.pending:
-            lines.append(f"[now, still speaking] {self.pending}")
+            lines.append(f"[now, still speaking] {display_line(self.pending)}")
         return "\n".join(lines)
 
     def since(self, minutes):
@@ -609,7 +955,7 @@ class Transcript:
         with self.lock:
             items = [(t, s) for t, s in self.entries[start:]
                      if not s.startswith(("YOU ASKED:", "CLAUDE:"))]
-        return "\n".join(f"[{t.strftime('%H:%M:%S')}] {s}" for t, s in items)
+        return "\n".join(f"[{t.strftime('%H:%M:%S')}] {display_line(s)}" for t, s in items)
 
     def full(self):
         with self.lock:
@@ -621,7 +967,7 @@ class Transcript:
                      if not s.startswith(("YOU ASKED:", "CLAUDE:"))][-n:]
             if self.pending:
                 items.append(self.pending)
-        return " ".join(items[-n:])
+        return " ".join(display_line(i) for i in items[-n:])
 
     def spoken_stats(self):
         """(lines, words) actually said in the meeting: typed questions,
@@ -657,9 +1003,12 @@ class Transcript:
                 f"{i}. [{'covered' if a in c['agenda_done'] else 'not covered yet'}] {a}"
                 for i, a in enumerate(c["agenda"], 1))
             people = ", ".join(c["participants"])
+            heard = ", ".join(s for s in self.speakers if s not in c["participants"])
             actions = "\n".join(
                 f"{i}. [{'done' if a['done'] else 'open'}] {a['text']}"
-                + (f" - owner: {a['owner']}" if a["owner"] else "")
+                + (f" - owner: {owner_text(a['owner'])}" if owner_text(a["owner"])
+                   else " - owner: unknown")
+                + (" (unsure)" if a["owner"] and not a.get("sure", True) else "")
                 + (f" - due: {a['due']}" if a["due"] else "")
                 for i, a in enumerate(c["actions"], 1))
             questions = "\n".join(
@@ -668,10 +1017,14 @@ class Transcript:
             ctx = "\n".join(f"- {x['title']} ({x['source']})" + (f": {x['detail']}" if x["detail"] else "")
                             for x in c["context"])
         return (
+            f"User's name: {profile.name or '(not known yet)'}"
+            f"{' (lines labelled You in the captions are this person)' if profile.name else ''}\n"
+            f"Meeting date: {fmt_day(self.started)} {self.started:%Y}\n"
             f"Meeting title: {c['title'] or '(not set)'}\n"
             f"Subject: {c['subject'] or '(not set)'}\n"
             f"Agenda:\n{agenda or '(not set)'}\n"
             f"Participants: {people or '(not set)'}\n"
+            f"Other names heard in the captions: {heard or '(none)'}\n"
             f"User's role: {c['role'] or '(not set)'}\n"
             f"User's goals: {c['goals'] or '(not set)'}\n"
             f"Action items so far:\n{actions or '(none)'}\n"
@@ -683,6 +1036,7 @@ class Transcript:
         )
 
 
+profile = Profile()
 transcript = Transcript()
 ui_queue = queue.Queue()        # server -> overlay
 question_queue = queue.Queue()  # overlay -> server
@@ -1181,7 +1535,7 @@ def meet_key(title):
     return m.group(0) if m else (title or "").lower()
 
 
-SIDENOTE_VERSION = "2026-11-11 v7"
+SIDENOTE_VERSION = "2026-11-11 v8"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -1260,9 +1614,11 @@ class MeetReader:
         self.cc_box = self.cc_btn = None
         for control, _ in _walk(win, 40):
             try:
-                name = (control.Name or "").strip().lower()
+                raw = (control.Name or "").strip()
+                name = raw.lower()
             except Exception:
                 continue
+            note_meet_label(raw)
             if name in ("captions", "subtítulos", "sous-titres", "subtitulos") and \
                     control.ControlTypeName in ("GroupControl", "CustomControl",
                                                 "PaneControl", "DocumentControl"):
@@ -1577,6 +1933,8 @@ class MacMeetReader:
                 self.key = meet_key(title)
                 cc_box = cc_btn = None
                 for el, _ in ax_walk(win, 60):
+                    note_meet_label(str(ax(el, "AXTitle") or "") or
+                                    str(ax(el, "AXDescription") or ""))
                     if ax(el, "AXRole") == "AXGroup" and (
                             str(ax(el, "AXTitle") or "") == "Captions" or
                             str(ax(el, "AXDescription") or "") == "Captions"):
@@ -1932,9 +2290,10 @@ mcp = FastMCP(
     "sidenote",
     instructions=(
         "You are Sidenote, a live meeting assistant for the user. The transcript comes "
-        "from Google Meet captions (lines start with the speaker's name; 'You' is the "
-        "user) or, as a fallback, the computer's Live Captions (no names; on Mac the lines "
-        "are 'Others' and the user's own microphone lines are 'You'). The meeting "
+        "from Google Meet captions (lines start with the speaker's name; the user's own "
+        "lines show the user's name, or 'You' while it is unknown) or, as a fallback, "
+        "the computer's Live Captions (no names; on Mac the lines are 'Others' and the "
+        "user's own microphone lines carry the user's name). The meeting "
         "info tells you which source is active. Captions may contain small recognition "
         "errors; read them charitably.\n\n"
         "OPENING: the Sidenote window is hidden until the user asks for it. When the "
@@ -1952,7 +2311,9 @@ mcp = FastMCP(
         "add_participants, then confirm briefly in the overlay. If the user hasn't "
         "given a title, you may set a short 'subject' with update_meeting_info once the "
         "topic is clear from the transcript; never invent a title, agenda, role or "
-        "participants.\n\n"
+        "participants. The user's name and role are remembered between meetings: never "
+        "ask for them again when the meeting info has them. If you know the user's name "
+        "and the meeting info says it is not known yet, pass it once as user_name.\n\n"
         "LIVE MODE: after opening Sidenote (or when the user says 'continue'), call "
         "wait_for_question in a loop. When it returns a QUESTION, answer it, send the "
         "answer with show_suggestion, then call wait_for_question again right away. "
@@ -1965,8 +2326,11 @@ mcp = FastMCP(
         "ACTION ITEMS AND QUESTIONS: keep two lists for the user. (1) When your answer "
         "suggests questions for the user to ask, also save each one with "
         "add_questions_to_ask (short, one line each). (2) When the transcript shows a "
-        "commitment or task (someone will do something), save it with add_action_item, "
-        "with the owner and due date only if they were said. Never duplicate items that "
+        "commitment or task (someone will do something), save it with add_action_item. "
+        "The owner is always a person's name: the speaker who committed ('I'll do X'), "
+        "else the person addressed ('Leon, can you...'), else a name said with the task; "
+        "'Team' for team-wide items; never 'you' or 'someone' (leave it empty if unsure: "
+        "the user picks it in one click). Pass the due date as said. Never duplicate items that "
         "are already in the lists sent with each question, and don't re-suggest "
         "questions marked 'asked'. If a saved question was clearly asked in the "
         "transcript, mark it with mark_done. These saves are silent: do not call "
@@ -2002,10 +2366,17 @@ mcp = FastMCP(
         "covered (Atlassian searches cost credits). (6) Only read from Jira and "
         "Confluence; never create or edit anything there unless the user explicitly "
         "asks and confirms.\n\n"
-        "RECAP: when asked for a recap, or when the meeting ends, write a quick recap "
-        "(2-3 sentence summary, decisions, action items with owners if known, open "
-        "questions; plain text, under 200 words) and save it with save_recap so it "
-        "goes into the meeting file."
+        "RECAP: when asked for a recap, or when the meeting ends, call get_full_transcript "
+        "and save the recap with save_recap in parts: summary (3 lines at most), "
+        "by_person (one line per person in the meeting, the user by name included: what "
+        "they reported, what they own, what they asked or are blocked on; 'Attended; no "
+        "update captured.' if they said little), decisions, and open_questions. Open "
+        "debates: when people stated different positions on the same topic without a "
+        "conclusion, add one line to open_questions: '- Topic: Name1 wants X; Name2 "
+        "wants Y (no conclusion)'. Sidenote adds the Action items, the To-ask questions "
+        "and the Context list to the file itself: do not repeat them. The file is read "
+        "by other people: real names (never 'You' or 'you' for a person) and real dates "
+        "(never 'today' or 'tomorrow'). This applies to every meeting type."
     ),
 )
 
@@ -2019,17 +2390,18 @@ MISSED_MINUTES = 3
 def _end_instructions(kind):
     if kind == "END":
         return ("END: the user clicked 'End meeting'. Call get_full_transcript, write the "
-                "quick recap and save it with save_recap (it is shown in the Sidenote window "
-                "automatically). In the recap, also list the context items used (title + "
-                "link), if any. Then call wait_for_question again: for 15 minutes Sidenote "
+                "recap and save it with save_recap in parts (summary, by_person, decisions, "
+                "open_questions incl. open debates; see the save_recap description). It is "
+                "shown in the Sidenote window automatically. Then call wait_for_question "
+                "again: for 15 minutes Sidenote "
                 "stays ready in case the user starts a new meeting from the window; after that "
                 "wait_for_question returns IDLE and you stop. Stop when it returns STOP, "
                 "CLOSED or IDLE.")
     count, _ = transcript.stats()
     if count and not transcript.context["recap"]:
-        recap = ("Before stopping: call get_full_transcript, write the quick recap (also "
-                 "listing the context items used, title + link, if any) and "
-                 "save it with save_recap, then tell the user in one line that the "
+        recap = ("Before stopping: call get_full_transcript, write the recap and save it "
+                 "with save_recap in parts (summary, by_person, decisions, open_questions), "
+                 "then tell the user in one line that the "
                  f"meeting file is saved ({transcript.file_path or 'Documents/Sidenote'}).")
     else:
         recap = "Then stop."
@@ -2064,24 +2436,24 @@ LIVE_NEXT = ("\n\nFIRST STEP (required): if you have Jira or Confluence tools in
 
 
 def core_open_sidenote(new_meeting=True, title="", agenda="", role="", goals="",
-                       participants=""):
+                       participants="", user_name=""):
     if window_open.is_set() and transcript.ended_at and new_meeting:
         transcript.new_meeting()
         core_update_meeting_info(title=title, agenda=agenda, role=role, goals=goals,
-                                 participants=participants)
+                                 participants=participants, user_name=user_name)
         ui_queue.put(("new_meeting", None))
         return ("New meeting started in the open Sidenote window.\n\n"
                 + transcript.context_text() + LIVE_NEXT)
     if window_open.is_set():
-        if any((title, agenda, role, goals, participants)):
-            core_update_meeting_info(title=title, agenda=agenda, role=role,
-                                     goals=goals, participants=participants)
+        if any((title, agenda, role, goals, participants, user_name)):
+            core_update_meeting_info(title=title, agenda=agenda, role=role, goals=goals,
+                                     participants=participants, user_name=user_name)
             return "Sidenote is already open. Meeting info updated." + LIVE_NEXT
         return "Sidenote is already open." + LIVE_NEXT
     if new_meeting:
         transcript.new_meeting()
     core_update_meeting_info(title=title, agenda=agenda, role=role, goals=goals,
-                             participants=participants)
+                             participants=participants, user_name=user_name)
     open_request.set()
     for _ in range(50):
         if window_open.is_set():
@@ -2212,7 +2584,9 @@ def _scan_if_ready():
     live.scanned_upto = total
     live.last_scan = now
     return ("SCAN: new transcript lines. Quickly save, if clearly present: action items "
-            "(add_action_item), questions the user should ask (add_questions_to_ask), "
+            "(add_action_item; owner = a person's name: who committed, else who was asked, "
+            "else a name said with it, 'Team' for everyone; empty if unsure), questions "
+            "the user should ask (add_questions_to_ask), "
             "agenda topics someone stated (add_agenda_items, never duplicates), and agenda "
             "items now clearly covered (mark_done kind 'agenda'). Usually there is little or "
             "nothing to save. Do not call show_suggestion. Then call wait_for_question "
@@ -2291,8 +2665,18 @@ def core_get_full_transcript():
             + (transcript.full() or "(empty)"))
 
 
+def set_user_name(name, source):
+    """Save the user's name (if this source may set it) and use it everywhere."""
+    if profile.set_name(name, source):
+        transcript.apply_user_name()
+        ui_queue.put(("info", None))
+        ui_queue.put(("lists", None))
+
+
 def core_update_meeting_info(title="", subject="", role="", goals="", participants="",
-                             agenda=""):
+                             agenda="", user_name=""):
+    if user_name:
+        set_user_name(user_name, "claude")
     transcript.update_context(title=title, subject=subject, role=role, goals=goals,
                               participants=participants, agenda=agenda)
     ui_queue.put(("info", None))
@@ -2315,7 +2699,12 @@ def core_add_participants(names):
 def core_add_action_item(task, owner="", due=""):
     added = transcript.add_action(task, owner, due)
     ui_queue.put(("lists", "actions" if added else None))
-    return "Action item saved." if added else "Already in the list (updated if needed)."
+    with transcript.lock:
+        item = next((a for a in transcript.context["actions"] if _same(a["text"], task)), None)
+    who = owner_text(item["owner"]) if item else ""
+    note = (f" Owner: {who}{'' if item.get('sure', True) else ' (unsure, the user can fix it)'}."
+            if who else " Owner unknown: the window shows 'Owner: ?' for the user to pick.")
+    return ("Action item saved." if added else "Already in the list (updated if needed).") + note
 
 
 def core_add_questions_to_ask(questions):
@@ -2364,9 +2753,39 @@ def core_add_context_item(title, source="", detail="", url=""):
     return "Not added: a title is required."
 
 
-def core_save_recap(recap):
-    transcript.update_context(recap=recap)
-    ui_queue.put(("recap", recap.strip()))
+def _by_person_complete(text):
+    """Make sure every person in the meeting has a line in BY PERSON (the user
+    by name, never 'You'), adding 'Attended; no update captured.' if missing."""
+    out = []
+    for line in (text or "").strip().splitlines():
+        line = line.rstrip()
+        m = re.match(r"^(\s*[-*\u2022]?\s*)(You|Me)(\s*[:\-\u2013])", line)
+        if m and profile.name:
+            line = m.group(1) + profile.name + line[m.end(2):]
+        out.append(line)
+    body = "\n".join(out).lower()
+    for person in transcript.people():
+        first = person.split()[0].lower()
+        if not re.search(r"(^|\n)\s*[-*\u2022]?\s*" + re.escape(first), body):
+            out.append(f"{person}: Attended; no update captured.")
+    return "\n".join(out).strip()
+
+
+def core_save_recap(recap="", summary="", by_person="", decisions="", open_questions=""):
+    summary = (summary or recap or "").strip()
+    by_person = _by_person_complete(by_person)
+    with transcript.lock:
+        c = transcript.context
+        c["recap"] = summary
+        c["by_person"] = by_person
+        if decisions.strip():
+            c["decisions"] = decisions.strip()
+        if open_questions.strip():
+            c["open_debates"] = open_questions.strip()
+        transcript.dirty = True
+    transcript.save_now()
+    shown = summary + (f"\n\n{by_person}" if by_person else "")
+    ui_queue.put(("recap", real_dates(shown, transcript.started)))
     return f"Recap saved in {transcript.file_path}"
 
 
@@ -2409,6 +2828,8 @@ def core_get_status():
             f"{count} lines in {minutes} min. "
             f"Sidenote: {live.label()}. File: {transcript.file_path or '(not saved yet)'}. "
             f"{auto_cc_status['text'] + '. ' if auto_cc_status['text'] else ''}"
+            f"{f'{transcript.replay_skipped} replayed caption lines skipped. ' if transcript.replay_skipped else ''}"
+            f"User: {profile.name or '(name not set)'}. "
             f"Version: {SIDENOTE_VERSION}")
 
 
@@ -2502,16 +2923,20 @@ async def run(op, **kwargs):
 # --- MCP tools ---------------------------------------------------------------
 @mcp.tool()
 async def open_sidenote(new_meeting: bool = True, title: str = "", agenda: str = "",
-                        role: str = "", goals: str = "", participants: str = "") -> str:
+                        role: str = "", goals: str = "", participants: str = "",
+                        user_name: str = "") -> str:
     """Show the Sidenote window and start reading Live Captions. Use when the user
     says 'start Sidenote' or 'open Sidenote'. Starts a new meeting unless
     new_meeting is false. Optionally pass the meeting title, agenda (one item per
     line), the user's role, goals and participants (comma separated).
+    user_name: the user's own name, if you know it (Sidenote uses it instead of
+    'You' everywhere; a name the user typed in Sidenote takes priority).
     Right after this returns, call wait_for_question and keep calling it in a
     loop until it returns STOP or CLOSED; don't stop to ask for missing meeting
     info. Sidenote shows 'Claude not connected' while no one is listening."""
     return await run("open_sidenote", new_meeting=new_meeting, title=title, agenda=agenda,
-                     role=role, goals=goals, participants=participants)
+                     role=role, goals=goals, participants=participants,
+                     user_name=user_name)
 
 
 @mcp.tool()
@@ -2532,13 +2957,15 @@ async def wait_for_question(timeout_seconds: int = WAIT_DEFAULT_SECONDS) -> str:
 @mcp.tool()
 async def update_meeting_info(title: str = "", subject: str = "", role: str = "",
                               goals: str = "", participants: str = "",
-                              agenda: str = "") -> str:
+                              agenda: str = "", user_name: str = "") -> str:
     """Save or change meeting info. Empty fields keep their value. 'agenda'
     replaces the whole agenda (one item per line); use add_agenda_items to add.
     'participants' replaces the list (comma separated). 'subject' is a short topic
-    used for the file name when there is no title."""
+    used for the file name when there is no title. The role is remembered for
+    the next meetings. user_name: the user's own name, if you know it."""
     return await run("update_meeting_info", title=title, subject=subject, role=role,
-                     goals=goals, participants=participants, agenda=agenda)
+                     goals=goals, participants=participants, agenda=agenda,
+                     user_name=user_name)
 
 
 @mcp.tool()
@@ -2556,8 +2983,13 @@ async def add_participants(names: str) -> str:
 
 @mcp.tool()
 async def add_action_item(task: str, owner: str = "", due: str = "") -> str:
-    """Save an action item from the meeting (a task someone committed to). Add the
-    owner and due date only if they were said. Duplicates are ignored."""
+    """Save an action item from the meeting (a task someone committed to).
+    owner: always a person's name, found in this order: the speaker who
+    committed ('I'll do X'), the person addressed ('Leon, can you...'), a name
+    mentioned with the task. Use 'Team' for team-wide items. Never 'you' or
+    'someone': if unsure, leave it empty and the user picks it in one click.
+    due: as said ('tomorrow', 'Friday'); Sidenote turns it into a real date.
+    Duplicates are ignored."""
     return await run("add_action_item", task=task, owner=owner, due=due)
 
 
@@ -2594,9 +3026,21 @@ async def add_context_item(title: str, source: str = "", detail: str = "",
 
 
 @mcp.tool()
-async def save_recap(recap: str) -> str:
-    """Save the quick recap of the meeting into the meeting file."""
-    return await run("save_recap", recap=recap)
+async def save_recap(summary: str = "", by_person: str = "", decisions: str = "",
+                     open_questions: str = "", recap: str = "") -> str:
+    """Save the meeting recap into the meeting file, in parts. Sidenote writes the
+    Action items, the To-ask questions and the Context list itself: never repeat
+    them here.
+    summary: at most 3 lines.
+    by_person: one line per person, 'Name: what they reported, what they own,
+    what they asked or are blocked on' (1-3 sentences), including the user by
+    name. Everyone gets a line, even 'Name: Attended; no update captured.'
+    decisions: one per line, '- ...'.
+    open_questions: unresolved questions and open debates, one per line. A debate:
+    '- Topic: Name1 wants X; Name2 wants Y (no conclusion)'.
+    Use real names, never 'You'/'you' for a person. recap: old single-text form."""
+    return await run("save_recap", summary=summary, by_person=by_person,
+                     decisions=decisions, open_questions=open_questions, recap=recap)
 
 
 @mcp.tool()
@@ -2674,7 +3118,7 @@ ICON_64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAHX0lEQVR4Xu1bb4hc1RX/n
 ICON_32 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEUElEQVR4XsVXW2gcVRj+zmUum9vSGklTawlaqFVQFF8VHwWtNKgBwQcRkaL4YNAKvgqCFfVBBAUffPApVhIsvvkiIojgpcVbJYRqa5JCqmw2252dmXN++c9MttnsTHbXBPzgsMPOmfP99/8/AgBo7nElZj4x505NHxrT4QuWcNySPWIJGoDgPbsASYFUCrkoBc6up9G7d52ev7zJKTYffn555sSwr9/zlTwYpQaJsbvg7IanJEKtEBu73IjT5+94c27BcfPWX1+ZOT7q+58xaSs1KQAlxK417wARCIAJtNIsTD2OHzn2xtxZ8cur05Pa+uc9pcZbiTFCQO2p6ttABBN4SiXGrKUyvlNL482OBN54LYqNFKKTnM0gJEdJn6GQ7XPK2mIXsoJRkppq6I+vt2hWC4gTUWpICtEZbEKA0hQmboK9wUf3CxZaVobA6haBuZiTuTUR3ZIYy+TXBXDkCXT1Buy//2GoodH87c4JQTnhtd/PYf27LyH8oEwIyfHG3FpkNi6AwMEnX0Rl6rZ+FW+jeu8DsK0m6ue/gRoaAZEtdAlzd5Oz9iaFHq0imJwCWeNcwf/1XgY2jZ3WlamjIJOAmg23ysCFphicNyaFDEKgxEaF4NjLleAzqvc9FJlrdVH/8etAaK/LJeUCMPK4NBs1mGYDbLCiuOJtZC1kUIEaGXOfUivC8NG744npZ9b5pD/WVvZFfy5q4Ye8uS17qQAuoXK2vz46jcZv30OGQ45oO1gwG7cQTB7G1OxbEEHFkcjh0Xb+ysoIbSXeRKkAHO+UB/2Bx04iWf8HQnGZKEotAVgDOTQK4fn52fzfFmFL6sLOLsjTzj9ws1v9gIN2EAwSXv1hWz3rhZ0tkMfA1S/OILq0WF5Y8sLl75/A+INPAG039EYPF2RIa38juXoFglOyJA0oiSGkcn1gkAGirzScePTZ3qrkcFVvAPRlgR3RYRHKLDSACXoIkKVcvHqpMA3DQ0eyStlu11yRBsuCHoUo0331zPvXCxFZ125tK8Lh517D8LF7QJYgZIHaW1tNQdth9ChE2aE3PXVqWykm7mTQ+25074t6GmeGbdRdPeMttrkhUNB4+0pDNVJ1axBwxjQu/OBfmf9wjJtRdHlJZ/NBZ5CWC8DjmNJZZbMlgdVVdITbzy7ib/l97avPQ+c21x+6y3i3AETu47ReQ2vlYjaQDFAvhcx6QfPiBQjlQVSGM63LegER2eKpiLD88Tv/eSTb+OlbyLDiZooyMDePZEuekrcmhu2c68pW0J6rgKuffrDnQykA6ykpEmOXNIEWQq1eaqXGyq0+dUJoaI+Db+/GcsdORKFWMjZmQVqVvL0RJ2uhpxVfGjrMxWMZz4TW5r/8vNPK9pX5m8EczMWczC1vf31+xRA97UmJQCsWIs2vUXsKPpPPZg7mYk7mlnxB5DtaLYqnhcDyWOhpXxeVtd2Bz+SzmYO5mLN9Of0/r+f/AiTkZfpa/zIeAAAAAElFTkSuQmCC"
 
 LOCAL_COMMAND = re.compile(
-    r"^\s*(title|subject|role|my role|goal|goals|agenda|participant|participants|people|todo|action|ask|q)\s*:\s*(.+)$",
+    r"^\s*(title|subject|role|my role|name|my name|goal|goals|agenda|participant|participants|people|todo|action|ask|q)\s*:\s*(.+)$",
     re.IGNORECASE | re.DOTALL)
 
 
@@ -2796,7 +3240,31 @@ class Overlay:
             self.chips[key] = {"frame": chip, "border": chip_border, "box": box,
                                "name": name, "badge": badge}
 
-        tk.Frame(self.root, bg=LINE, height=1).pack(fill="x", padx=pad, pady=(6, 0))
+        self._divider = tk.Frame(self.root, bg=LINE, height=1)
+        self._divider.pack(fill="x", padx=pad, pady=(6, 0))
+
+        # ---- name question: asked once, inline (no popup, never takes focus) --
+        self.name_bar = tk.Frame(self.root, bg=SURFACE, padx=10, pady=6)
+        tk.Label(self.name_bar, text="What name should Sidenote use for you?", bg=SURFACE,
+                 fg=FG, font=(FONT, 9), anchor="w").pack(fill="x")
+        row = tk.Frame(self.name_bar, bg=SURFACE)
+        row.pack(fill="x", pady=(4, 0))
+        close = tk.Label(row, text="✕", bg=SURFACE, fg=MUTED, font=(FONT, 9),
+                         cursor="hand2", padx=4)
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda e: self._name_later())
+        save = tk.Label(row, text="Save", bg=ACCENT, fg="#ffffff", font=(FONT, 9, "bold"),
+                        padx=10, pady=2, cursor="hand2")
+        save.pack(side="right", padx=(6, 4))
+        save.bind("<Button-1>", lambda e: self._name_save())
+        self._hover(save, ACCENT, ACCENT_HI)
+        self.name_entry = tk.Entry(row, bg=BG, fg=FG, insertbackground=FG, relief="flat",
+                                   font=(FONT, 10), borderwidth=0, highlightthickness=1,
+                                   highlightbackground=LINE, highlightcolor=ACCENT)
+        self.name_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self.name_entry.insert(0, os_full_name())          # pre-filled guess
+        self.name_entry.bind("<Return>", lambda e: self._name_save())
+        self._name_bar_shown = False
 
         # ---- footer (packed before the body so it always stays visible) -----
         footer = tk.Frame(self.root, bg=BG)
@@ -2885,6 +3353,7 @@ class Overlay:
             text.tag_configure("speaker", foreground=MUTED, font=(FONT, 9, "bold"))
             text.tag_configure("time", foreground=FAINT, font=(FONT, 8))
             text.tag_configure("note", foreground=ACCENT_HI)
+            text.tag_configure("ask_owner", foreground=WARN, font=(FONT, 8, "bold"))
             text.tag_configure("hover", background=SURFACE)
             text.configure(state="disabled")
             self.panels[key] = frame
@@ -3240,6 +3709,32 @@ class Overlay:
         # Version in the window title is a testing aid (remove before release)
         self.root.title(f"Sidenote {SIDENOTE_VERSION}" + (f" - {title}" if title else ""))
 
+    # ---- the user's name ------------------------------------------------------------
+    def _update_name_bar(self):
+        """Ask for the user's name once: only while no name is known and the
+        user hasn't answered or dismissed the question."""
+        want = not profile.name and not profile.data["name_asked"]
+        if want and not self._name_bar_shown:
+            self.name_bar.pack(fill="x", padx=16, pady=(8, 0), after=self._divider)
+        elif not want and self._name_bar_shown:
+            self.name_bar.pack_forget()
+        self._name_bar_shown = want
+
+    def _name_save(self):
+        name = self.name_entry.get().strip()
+        if not name:
+            self.toast("Type a name, or close this with ✕")
+            return
+        set_user_name(name, "typed")
+        profile.mark_asked()
+        self._update_name_bar()
+        self.toast(f"Sidenote will call you {profile.name}")
+
+    def _name_later(self):
+        profile.mark_asked()          # asked once: don't ask again (editable in Meeting info)
+        self._update_name_bar()
+        self.toast("You can add your name later in ⋯ > Meeting info")
+
     def open_menu(self, event=None):
         menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=FG, activebackground=ACCENT,
                        activeforeground="#ffffff", bd=0, font=(FONT, 9))
@@ -3320,7 +3815,9 @@ class Overlay:
             fields[key] = box
 
         row("Meeting title", "title", c["title"])
-        row("My role", "role", c["role"])
+        row("My name  (used instead of “You”, kept for next meetings)", "name",
+            profile.name)
+        row("My role  (kept for next meetings)", "role", c["role"])
         row("My goals", "goals", c["goals"])
         row("Participants  (comma separated)", "participants", ", ".join(c["participants"]))
         row("Agenda  (one item per line)", "agenda", "\n".join(c["agenda"]), multiline=True)
@@ -3337,6 +3834,11 @@ class Overlay:
                 cc["participants"] = parse_list(get("participants"))
                 cc["agenda"] = parse_list(get("agenda")) if get("agenda") else []
                 cc["agenda_done"] = [a for a in cc["agenda_done"] if a in cc["agenda"]]
+            profile.set_role(get("role"))         # an empty field clears the saved role
+            if get("name") != profile.name:
+                set_user_name(get("name"), "typed")
+                profile.mark_asked()
+                self._update_name_bar()
             transcript.save_now()
             self.update_info()
             self.refresh_lists()
@@ -3384,6 +3886,11 @@ class Overlay:
         elif key in ("participant", "participants", "people"):
             added = transcript.add_participants(value)
             msg = "Added: " + ", ".join(added)
+        elif key in ("name", "my name"):
+            set_user_name(value, "typed")
+            profile.mark_asked()
+            self._update_name_bar()
+            msg = f"Sidenote will call you {profile.name}"
         else:
             field = {"my role": "role", "goal": "goals"}.get(key, key)
             transcript.update_context(**{field: value})
@@ -3596,6 +4103,7 @@ class Overlay:
             self._fit_chips()
         try:
             self._render_feed()
+            self._update_name_bar()
         except Exception as e:
             log.info("Conversation view update failed: %s", e)
         self.root.after(300, self.refresh)
@@ -3702,14 +4210,23 @@ class Overlay:
             text.insert("end", "  \u2713   " if item["done"] else "  \u25cb   ",
                         ("check" if item["done"] else "box", tag))
             text.insert("end", item["text"], ("done", tag) if item["done"] else (tag,))
-            extra = []
             if key == "actions":
-                if item.get("owner"):
-                    extra.append(item["owner"])
+                # Owner after the task: "(Leon)". Unknown or unsure owners are
+                # one click to fix: "Owner: ?" / "Leon?" open a list of names.
+                who = owner_text(item.get("owner", ""))
+                sure = item.get("sure", True)
+                otag = f"owner{item['index']}"
+                if who and sure:
+                    text.insert("end", f"  ({who})", ("meta", tag))
+                else:
+                    text.insert("end", "  ")
+                    text.insert("end", f"{who}?" if who else "Owner: ?", ("ask_owner", otag))
+                    text.tag_bind(otag, "<Button-1>",
+                                  lambda e, i=item["index"]: self.pick_owner(i, e))
+                    text.tag_bind(otag, "<Enter>", lambda e, t=text: t.configure(cursor="hand2"))
+                    text.tag_bind(otag, "<Leave>", lambda e, t=text: t.configure(cursor="arrow"))
                 if item.get("due"):
-                    extra.append(item["due"])
-            if extra:
-                text.insert("end", "    " + " \u00b7 ".join(extra), ("meta", tag))
+                    text.insert("end", "  \u00b7 " + item["due"], ("meta", tag))
             text.insert("end", "\n", (tag,))
             text.tag_bind(tag, "<Button-1>",
                           lambda e, k=key, i=item["index"], d=item["done"]: self.check_item(k, i, not d))
@@ -3785,6 +4302,35 @@ class Overlay:
         except Exception:
             pass
 
+    def pick_owner(self, index, event=None):
+        """One click: a short list of the people in the meeting (the user by
+        name, participants, names heard), plus Team and Other."""
+        menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=FG, activebackground=ACCENT,
+                       activeforeground="#ffffff", bd=0, font=(FONT, 9))
+        for person in transcript.people():
+            menu.add_command(label=person, command=lambda p=person: self._set_owner(index, p))
+        menu.add_command(label="Team", command=lambda: self._set_owner(index, "Team"))
+        menu.add_separator()
+        menu.add_command(label="Other…", command=lambda: self._other_owner(index))
+        x = event.x_root if event else self.root.winfo_pointerx()
+        y = event.y_root if event else self.root.winfo_pointery()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _set_owner(self, index, owner):
+        transcript.set_owner(index, owner)
+        self.render_list("actions")
+        self.toast(f"Owner: {owner}")
+
+    def _other_owner(self, index):
+        from tkinter import simpledialog
+        name = simpledialog.askstring("Owner", "Who owns this action item?", parent=self.root)
+        if name and name.strip():
+            self._set_owner(index, name.strip())
+
     def check_item(self, key, index, done):
         transcript.set_done(key, index, done)
         self.render_list(key)
@@ -3817,7 +4363,7 @@ class Overlay:
                 continue
             speaker, sep, rest = line.partition(": ")
             if sep and len(speaker) <= 40:
-                text.insert("end", speaker + "  ", "speaker")
+                text.insert("end", speaker_name(speaker) + "  ", "speaker")
                 text.insert("end", rest + "\n")
             else:
                 text.insert("end", line + "\n")

@@ -1,5 +1,5 @@
 SIDENOTE - TESTER GUIDE (Mac)
-Version 2026-11-11 v7
+Version 2026-11-11 v8
 
 Sidenote is a small window that sits next to your meeting. It reads the
 meeting captions and lets you ask Claude about the meeting while it happens.
@@ -7,7 +7,7 @@ Meeting notes are saved only on your Mac, in Documents/Sidenote.
 
 You need: a Mac with the latest macOS, Google Chrome, the Claude desktop app
 (signed in), an internet connection, and the file
-Sidenote-2026-11-11-v7.mcpb.
+Sidenote-2026-11-11-v8.mcpb.
 
 
 BEFORE YOU START
@@ -18,7 +18,7 @@ BEFORE YOU START
 
 INSTALL
 
-2. Double-click Sidenote-2026-11-11-v7.mcpb. Claude opens and shows the
+2. Double-click Sidenote-2026-11-11-v8.mcpb. Claude opens and shows the
    Sidenote extension. Click Install.
    (Or open Claude > Settings > Extensions and drag the file into the window.)
 
@@ -46,6 +46,9 @@ FIRST START
 7. After turning on Claude in step 6a, quit Claude with Cmd+Q, open it
    again, and type "open Sidenote" in a chat once more. The Sidenote window
    appears next to your screen.
+   The first time, Sidenote may ask at the top of its window: "What name
+   should Sidenote use for you?". Check the name and click Save (it is
+   used instead of "You" in the notes, and never asked again).
 
 
 TRY IT IN A GOOGLE MEET CALL
@@ -61,15 +64,19 @@ TRY IT IN A GOOGLE MEET CALL
    - After about 3 minutes Sidenote should give the meeting a title and
      1-2 agenda items by itself.
    - Open the Agenda, Actions and Transcript views with the buttons at
-     the top.
-   - At the end, click "End meeting". Claude writes a short recap.
+     the top. Each action item shows its owner, e.g. "Check staging
+     (Leon)". If it says "Owner: ?", click it and pick a name.
+   - At the end, click "End meeting". Claude writes the recap: a short
+     summary, one line per person, decisions, action items and open
+     questions. Open the meeting file (... > Open meetings folder) and
+     check whether you could forward it as is.
 
 
 CHECK THE VERSION
 
 9. In the Claude chat, ask:
        What's Sidenote's status?
-   The answer ends with "Version: 2026-11-11 v7". The Sidenote window title
+   The answer ends with "Version: 2026-11-11 v8". The Sidenote window title
    shows the same version.
 
 
@@ -77,8 +84,10 @@ IF THE SIDENOTE WINDOW DOES NOT APPEAR
 
 10. Quit Claude with Cmd+Q. Open Terminal (Applications > Utilities >
     Terminal), type this line and press Return:
-        pkill -f sidenote.py
-    Then open Claude again and type "open Sidenote" in a chat.
+        sudo pkill -f sidenote.py
+    Type your Mac password and press Return (the letters don't show while
+    you type; that's normal). Then open Claude again and type
+    "open Sidenote" in a chat.
     If it still does not appear, take a screenshot of the Claude chat and
     send it to me.
 

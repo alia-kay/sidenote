@@ -45,6 +45,27 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
    Close the Sidenote window to end the meeting. Meeting notes are saved in
    Documents/Sidenote.
 
+7. What Sidenote remembers about you
+   - Your name: the first time, Sidenote asks "What name should Sidenote use for
+     you?" at the top of its window (it may already know it from Google Meet or
+     from Claude, then it doesn't ask). It uses your name instead of "You" in
+     action items, the transcript and the recap.
+   - Your role: fill it in once (... > Meeting info, or type  role: Product
+     owner) and every new meeting starts with it. Goals are per meeting.
+   Change either any time in ... > Meeting info (you can also type  name: Iman).
+   Both are kept on your computer in Documents/Sidenote/profile.json.
+
+8. Action items and the recap
+   - Each action item shows its owner, e.g. "Check staging (Leon)". If Sidenote
+     doesn't know the owner it shows "Owner: ?" (or "Leon?" if it's unsure):
+     click it and pick the right person.
+   - When the meeting ends, the meeting file starts with a short Summary, then
+     one line per person, Decisions, Action items (with owners and real dates,
+     like "Tue 10 Nov"), Open questions (including debates that weren't
+     settled), Context links and the Transcript. It's written to be forwarded
+     as is. Your typed questions and Claude's answers stay in the window and
+     are not saved in the file.
+
 If macOS asks whether Claude may access your Documents folder, allow it.
 Everything stays on your computer except what you send to Claude.
 
