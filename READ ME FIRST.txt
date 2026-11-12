@@ -33,9 +33,11 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
 
 6. Use it
    In a Claude chat, type: open Sidenote
-   The Sidenote window opens on its Home screen with two choices:
-   - Record a meeting: Sidenote starts reading captions (see below).
-   - History: your saved meetings (see step 9).
+   The Sidenote window has two tabs at the top, always there:
+   - + (New meeting): click "Start meeting" and Sidenote reads the captions
+     of your call (see below). While a meeting records, the + has a dot.
+   - The clock icon (Past meetings): your saved meetings (see step 9). You
+     can look at them during a meeting; the recording goes on.
    - Google Meet (in Chrome): Sidenote turns on Meet's captions by itself
      (the CC button) and reads them, including your own voice. If captions
      don't come on within a few seconds, press CC yourself. If you turn
@@ -79,26 +81,26 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
      settled), Context links and the Transcript. It's written to be forwarded
      as is. Your typed questions and Claude's answers stay in the window and
      are not saved in the file.
-   - After the meeting, the button at the top right says "Home".
+   - After the meeting, the button at the top right says "New meeting".
 
-9. History: your past meetings
-   - Open History from the Home screen (or ... > Meeting history). Search,
-     filter (last 7 / 30 days, open action items) and click a meeting to see
-     its summary, decisions, open questions and action items. The transcript
-     is folded away; click "Show transcript" to open it.
+9. Past meetings (the clock icon)
+   - On the left: your meetings by day (Today, Yesterday, This week ...). At the
+     top, "All meetings" shows every open action item and recent decision.
+   - Click a meeting to see its summary, action items, decisions and open
+     questions. The transcript is folded away; click "Show ... lines".
    - Tick an action item to mark it done (untick to reopen). This works even
      when Claude isn't connected.
-   - Ask Claude about one meeting or all of them in the box at the bottom, e.g.
-     "What are my open action items from the last two weeks?". Claude always
-     says which meeting and date an answer comes from.
+   - Ask Claude in the box at the bottom: about the meeting you selected, or
+     about all of them when "All meetings" is selected, e.g. "What are my open
+     action items from the last two weeks?". Claude always says which meeting
+     and date an answer comes from.
    - You can also ask in a normal Claude chat when the Sidenote window is
      closed, e.g. "what did we decide about pricing?".
    - Claude closes an action item only when you ask it to. Items it closed show
      "closed by Claude", with an undo link.
-   - Click Record (top right) to start a meeting straight from History.
    - Each meeting is saved twice in Documents/Sidenote: the readable .txt file
-     and a .meeting.json file with the same name (used by History). Meetings
-     saved by older versions are added to History automatically; their .txt
+     and a .meeting.json file with the same name (used for Past meetings).
+     Meetings saved by older versions are added automatically; their .txt
      files are never changed.
 
 If macOS asks whether Claude may access your Documents folder, allow it.

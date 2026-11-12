@@ -54,7 +54,7 @@ FIRST START
 TRY IT IN A GOOGLE MEET CALL
 
 8. Join a Google Meet call in Chrome (a call with a friend or colleague,
-   or a test call on your own). In the Sidenote window click "Record a
+   or a test call on your own). In the Sidenote window click "Start
    meeting", then talk for a few minutes.
    - Turn on captions in Meet (the CC button). Sidenote tries to turn them
      on by itself.
@@ -113,11 +113,11 @@ TRY IT IN A GOOGLE MEET CALL
      nothing from other windows.
 
 
-8e. History:
-   - After a meeting or two, click "Home" (top right), then History. Open a
-     meeting, tick an action item, and ask in the box at the bottom: "What
-     are my open action items?". Then close the Sidenote window and ask the
-     same in a normal Claude chat.
+8e. Past meetings (the clock icon at the top):
+   - After a meeting or two, click the clock icon. Pick a meeting on the
+     left, tick an action item, and ask in the box at the bottom: "What are
+     my open action items?". Then close the Sidenote window and ask the same
+     in a normal Claude chat.
 
 
 CHECK THE VERSION

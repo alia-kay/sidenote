@@ -55,7 +55,8 @@ MAC_MIC_ENABLED = True
 CAPTIONS_WINDOW_CLASS = "LiveCaptionsDesktopWindow"
 CAPTIONS_TEXT_ID = "CaptionsTextBlock"
 WAIT_DEFAULT_SECONDS = 50       # how long one wait_for_question call listens
-HISTORY_WAIT_SECONDS = 240      # ...on the Home/History screens (cheaper for Claude)
+HISTORY_WAIT_SECONDS = 50       # ...when nothing is recording
+WAIT_MAX_SECONDS = 55           # Claude's tool calls time out after about 60 s: stay below
 HISTORY_IDLE_SECONDS = 15 * 60  # no question this long on Home/History -> IDLE
 ENDED_GRACE_SECONDS = 15 * 60  # after End meeting, stay ready this long for a new one
 CUE_DELAY_SECONDS = 4          # wait this long after a cue phrase (sentence may continue)
@@ -1193,6 +1194,7 @@ class Transcript:
 SCHEMA_VERSION = 1
 MEETING_EXT = ".meeting.json"
 INDEX_NAME = ".sidenote_index.json"
+INDEX_VERSION = 2               # bump when the cached fields change (cache is rebuilt)
 _history_lock = threading.RLock()
 
 
@@ -1484,11 +1486,23 @@ def import_old_meetings():
 
 
 # ---- index (cache) and queries ----------------------------------------------------
+def _title_from(summary):
+    """A name for a meeting without a title: the start of its summary."""
+    text = re.sub(r"^(?:quick recap|summary)\s*[:\-]\s*", "", (summary or "").strip(), flags=re.I)
+    text = re.split(r"[.;:(\n]", text)[0].strip()
+    words = text.split()
+    if not words:
+        return "Untitled meeting"
+    words[0] = words[0][:1].upper() + words[0][1:]
+    short = " ".join(words[:6])
+    return short + ("\u2026" if len(words) > 6 else "")
+
+
 def _index_entry(d, stat):
     summary = (d["summary"] or "").strip().splitlines()
     line = summary[0] if summary else (d["agenda"][0]["text"] if d["agenda"] else "")
     return {"id": d["id"], "path": d["_path"], "mtime": stat.st_mtime, "size": stat.st_size,
-            "title": d["title"] or d["subject"] or "Untitled meeting", "date": d["date"],
+            "title": d["title"] or d["subject"] or _title_from(d["summary"]), "date": d["date"],
             "start": d["start"], "end": d["end"], "participants": d["participants"],
             "summary_line": line[:200], "imported": d["imported"],
             "action_items": d["action_items"], "decisions": d["decisions"],
@@ -1505,7 +1519,8 @@ def history_index():
         try:
             with open(path, encoding="utf-8") as f:
                 cache = json.load(f)
-            if cache.get("schema_version") != SCHEMA_VERSION:
+            if cache.get("schema_version") != SCHEMA_VERSION or \
+                    cache.get("index_version") != INDEX_VERSION:
                 cache = {}
         except Exception:
             cache = {}
@@ -1527,7 +1542,8 @@ def history_index():
                 log.info("Skipped unreadable meeting file %s: %s", os.path.basename(file), ex)
         if changed or len(entries) != len(old):
             try:
-                _write_json(path, {"schema_version": SCHEMA_VERSION, "meetings": entries})
+                _write_json(path, {"schema_version": SCHEMA_VERSION,
+                                   "index_version": INDEX_VERSION, "meetings": entries})
             except OSError:
                 pass
         entries.sort(key=lambda e: (e["date"], e["start"]), reverse=True)
@@ -3821,7 +3837,8 @@ mcp = FastMCP(
         "errors; read them charitably.\n\n"
         "OPENING: the Sidenote window is hidden until the user asks for it. When the "
         "user says 'start Sidenote' or 'open Sidenote', call open_sidenote: the window "
-        "opens on its Home screen, where the user chooses Record a meeting or History. "
+        "opens with two tabs, New meeting (where the user starts recording) and Past "
+        "meetings. "
         "Pass new_meeting=true only if the user explicitly asked to record or start a "
         "meeting now. Pass the meeting title, agenda, role, goals and participants if the "
         "user gave them. Start the wait_for_question loop right away in every case, "
@@ -4008,8 +4025,8 @@ def core_open_sidenote(new_meeting=False, title="", agenda="", role="", goals=""
         time.sleep(0.1)
     if new_meeting:
         return "Sidenote is open and recording a new meeting." + LIVE_NEXT
-    return ("Sidenote is open on its Home screen: the user chooses Record a meeting or "
-            "History. Don't ask them anything in the chat." + LIVE_NEXT)
+    return ("Sidenote is open on its New meeting tab (past meetings are on the other tab); "
+            "the user starts the meeting there. Don't ask them anything in the chat." + LIVE_NEXT)
 
 
 def end_if_needed():
@@ -4150,7 +4167,7 @@ def _history_idle():
     return live.mode != "record" and time.time() - live.last_activity > HISTORY_IDLE_SECONDS
 
 
-HISTORY_IDLE_TEXT = ("IDLE: no questions for 15 minutes on Sidenote's Home/History screen. Stop "
+HISTORY_IDLE_TEXT = ("IDLE: no questions for 15 minutes while Sidenote wasn't recording. Stop "
                      "calling wait_for_question. Tell the user in one short line that Sidenote "
                      "is idle and that typing 'open Sidenote' in Claude reconnects it.")
 
@@ -4160,7 +4177,7 @@ def _history_question(q):
     e = find_meeting(meeting_id) if meeting_id else None
     scope = (f"the meeting \u201c{e['title']}\u201d ({_day_label(e)}, id {e['id']})" if e
              else "all past meetings")
-    text = (f"HISTORY QUESTION (asked on Sidenote's History screen, about {scope}): "
+    text = (f"HISTORY QUESTION (asked on Sidenote's Past meetings tab, about {scope}): "
             f"{q.get('text', '')}\n\n"
             "Answer from the saved meetings with the history tools. Start cheap: "
             "list_meetings, find_items, get_meeting (no transcript). Load a transcript "
@@ -4169,7 +4186,7 @@ def _history_question(q):
             "everything you say (e.g. 'from the Nov 5 sync with Lee'). Short plain text, under "
             "120 words. Change an item's status only if the user explicitly asks (update_item "
             "with their words as evidence); if more than one item could match, ask which one "
-            "first. Send the answer with show_suggestion (it appears in the History chat), then "
+            "first. Send the answer with show_suggestion (it appears in the Past meetings tab), then "
             "call wait_for_question again.")
     if e:
         text += "\n\n--- SELECTED MEETING ---\n" + core_get_meeting(e["id"])
@@ -4178,7 +4195,7 @@ def _history_question(q):
 
 def core_wait_for_question(timeout_seconds=WAIT_DEFAULT_SECONDS):
     start_mode = live.mode
-    timeout = max(5, min(int(timeout_seconds), 300)) if start_mode == "record" \
+    timeout = max(5, min(int(timeout_seconds), WAIT_MAX_SECONDS)) if start_mode == "record" \
         else HISTORY_WAIT_SECONDS
     if not window_open.is_set():
         return _end_instructions("CLOSED")
@@ -4667,7 +4684,7 @@ def core_show_suggestion(text):
     text = text.strip()
     if live.answer_target == "history":
         ui_queue.put(("history_answer", text))
-        return "Shown in the History chat."
+        return "Shown in the Past meetings tab."
     if live.answer_target == "dropped":
         live.answer_target = "live"
         return ("Not shown: the user started recording a meeting, so the History question was "
@@ -4738,6 +4755,59 @@ OPS = {
 PEER_ADDRESS = ("127.0.0.1", 47821)
 PEER_AUTHKEY = b"sidenote-local-v1"
 role = {"primary": False}
+
+
+# When Sidenote is updated, an older copy can still be running and owning the
+# window. A newer copy asks it to save, close and exit, then takes over, so the
+# latest code always runs.
+try:
+    CODE_STAMP = os.path.getmtime(os.path.abspath(__file__))
+except OSError:
+    CODE_STAMP = 0.0
+
+
+def core__info():
+    return {"version": SIDENOTE_VERSION, "stamp": CODE_STAMP, "window": window_open.is_set()}
+
+
+def core__handover():
+    """A newer Sidenote is starting: save, close the window and exit."""
+    log.info("A newer Sidenote is starting: saving and handing over")
+    had_window = window_open.is_set()
+    try:
+        transcript.save_now()
+    except Exception:
+        pass
+    ui_queue.put(("close", None))
+
+    def leave():
+        try:
+            captions_win.show_now()
+        except Exception:
+            pass
+        os._exit(0)
+    threading.Timer(1.5, leave).start()
+    return {"window": had_window}
+
+
+OPS["_info"] = core__info            # (registered here: they are defined after OPS)
+OPS["_handover"] = core__handover
+
+
+def take_over_from_older(wait=12.0):
+    """If the running primary copy has older code, ask it to hand over and take
+    its place. Returns (became_primary, its_window_was_open)."""
+    info = call("_info", {})
+    if not isinstance(info, dict) or info.get("stamp", 0) >= CODE_STAMP - 1:
+        return False, False                     # same code, newer code, or a very old copy
+    log.info("An older Sidenote (%s) is running: taking over", info.get("version"))
+    result = call("_handover", {})
+    end = time.time() + wait
+    while time.time() < end:
+        time.sleep(0.5)
+        if try_become_primary():
+            return True, isinstance(result, dict) and result.get("window", False)
+    return False, False
 
 
 def try_become_primary():
@@ -5045,13 +5115,16 @@ ACCENT = "#d97757"      # Sidenote orange
 ACCENT_HI = "#e58a6c"
 OK = "#6cc28a"          # green status dot
 WARN = "#e0a458"        # amber status
+END_RED = "#8e2b2b"     # End meeting (dark red)
+END_RED_HI = "#a83434"
 FIELD = SURFACE
 FONT = "Helvetica Neue" if IS_MAC else "Segoe UI"
 MAC_UI_SCALE = 1.45      # text size multiplier on macOS
 
 
-ICON_64 = "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"
-ICON_32 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEUElEQVR4XsVXW2gcVRj+zmUum9vSGklTawlaqFVQFF8VHwWtNKgBwQcRkaL4YNAKvgqCFfVBBAUffPApVhIsvvkiIojgpcVbJYRqa5JCqmw2252dmXN++c9MttnsTHbXBPzgsMPOmfP99/8/AgBo7nElZj4x505NHxrT4QuWcNySPWIJGoDgPbsASYFUCrkoBc6up9G7d52ev7zJKTYffn555sSwr9/zlTwYpQaJsbvg7IanJEKtEBu73IjT5+94c27BcfPWX1+ZOT7q+58xaSs1KQAlxK417wARCIAJtNIsTD2OHzn2xtxZ8cur05Pa+uc9pcZbiTFCQO2p6ttABBN4SiXGrKUyvlNL482OBN54LYqNFKKTnM0gJEdJn6GQ7XPK2mIXsoJRkppq6I+vt2hWC4gTUWpICtEZbEKA0hQmboK9wUf3CxZaVobA6haBuZiTuTUR3ZIYy+TXBXDkCXT1Buy//2GoodH87c4JQTnhtd/PYf27LyH8oEwIyfHG3FpkNi6AwMEnX0Rl6rZ+FW+jeu8DsK0m6ue/gRoaAZEtdAlzd5Oz9iaFHq0imJwCWeNcwf/1XgY2jZ3WlamjIJOAmg23ysCFphicNyaFDEKgxEaF4NjLleAzqvc9FJlrdVH/8etAaK/LJeUCMPK4NBs1mGYDbLCiuOJtZC1kUIEaGXOfUivC8NG744npZ9b5pD/WVvZFfy5q4Ye8uS17qQAuoXK2vz46jcZv30OGQ45oO1gwG7cQTB7G1OxbEEHFkcjh0Xb+ysoIbSXeRKkAHO+UB/2Bx04iWf8HQnGZKEotAVgDOTQK4fn52fzfFmFL6sLOLsjTzj9ws1v9gIN2EAwSXv1hWz3rhZ0tkMfA1S/OILq0WF5Y8sLl75/A+INPAG039EYPF2RIa38juXoFglOyJA0oiSGkcn1gkAGirzScePTZ3qrkcFVvAPRlgR3RYRHKLDSACXoIkKVcvHqpMA3DQ0eyStlu11yRBsuCHoUo0331zPvXCxFZ125tK8Lh517D8LF7QJYgZIHaW1tNQdth9ChE2aE3PXVqWykm7mTQ+25074t6GmeGbdRdPeMttrkhUNB4+0pDNVJ1axBwxjQu/OBfmf9wjJtRdHlJZ/NBZ5CWC8DjmNJZZbMlgdVVdITbzy7ib/l97avPQ+c21x+6y3i3AETu47ReQ2vlYjaQDFAvhcx6QfPiBQjlQVSGM63LegER2eKpiLD88Tv/eSTb+OlbyLDiZooyMDePZEuekrcmhu2c68pW0J6rgKuffrDnQykA6ykpEmOXNIEWQq1eaqXGyq0+dUJoaI+Db+/GcsdORKFWMjZmQVqVvL0RJ2uhpxVfGjrMxWMZz4TW5r/8vNPK9pX5m8EczMWczC1vf31+xRA97UmJQCsWIs2vUXsKPpPPZg7mYk7mlnxB5DtaLYqnhcDyWOhpXxeVtd2Bz+SzmYO5mLN9Of0/r+f/AiTkZfpa/zIeAAAAAElFTkSuQmCC"
+ICON_256 = "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"
+ICON_64 = "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"
+ICON_32 = "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"
 
 LOCAL_COMMAND = re.compile(
     r"^\s*(title|subject|role|my role|name|my name|goal|goals|agenda|participant|participants|people|todo|action|ask|q)\s*:\s*(.+)$",
@@ -5065,6 +5138,226 @@ def set_app_id():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Sidenote.MeetingAssistant")
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Drawing helpers for the window (rounded pills, icon tabs, rounded input)
+# ---------------------------------------------------------------------------
+SERIF = "Georgia"            # ships with Windows and macOS
+UI_SCALE = [1.0]             # display scaling (200% on a high-DPI screen = 2.0)
+
+
+def px(n):
+    """Pixels at the current display scaling (Tk scales fonts, not pixel sizes)."""
+    return int(round(n * UI_SCALE[0]))
+
+
+def round_rect(canvas, x1, y1, x2, y2, r, **kw):
+    r = max(1, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2,
+           x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return canvas.create_polygon(pts, smooth=True, **kw)
+
+
+class Tooltip:
+    """A small label next to the pointer after a short hover."""
+
+    def __init__(self, widget, text):
+        self.widget, self.text, self.win, self.job = widget, text, None, None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<Button-1>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self.job = self.widget.after(500, self._show)
+
+    def _show(self):
+        if self.win is not None:
+            return
+        x = self.widget.winfo_rootx() + 4
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.win = tk.Toplevel(self.widget)
+        self.win.wm_overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.geometry(f"+{x}+{y}")
+        tk.Label(self.win, text=self.text, bg=SURFACE_HI, fg=FG, font=(FONT, 8),
+                 padx=8, pady=3).pack()
+
+    def _hide(self, _e=None):
+        if self.job:
+            self.widget.after_cancel(self.job)
+            self.job = None
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+
+
+class Pill(tk.Canvas):
+    """A small rounded label, e.g. '● 12 min' or '3 people'."""
+
+    def __init__(self, parent, text="", fg=MUTED, bg=SURFACE, parent_bg=BG, size=8,
+                 command=None, height=22):
+        height = px(height)
+        super().__init__(parent, height=height, width=10, bg=parent_bg,
+                         highlightthickness=0, bd=0)
+        import tkinter.font as tkfont
+        self.font = tkfont.Font(family=FONT, size=size)
+        self.h, self.state_ = height, None
+        self.pill_bg = bg
+        self.command = command
+        if command:
+            self.configure(cursor="hand2")
+            self.bind("<Button-1>", lambda e: self.command())
+        self.set(text, fg)
+
+    def set(self, text, fg=None, bg=None, clickable=None):
+        fg = fg or MUTED
+        bg = bg or self.pill_bg
+        if (text, fg, bg) == self.state_:
+            return
+        self.state_ = (text, fg, bg)
+        self.delete("all")
+        if not text:
+            self.configure(width=1)
+            return
+        w = self.font.measure(text) + px(22)
+        self.configure(width=w)
+        round_rect(self, 1, 1, w - 1, self.h - 1, self.h // 2, fill=bg, outline="")
+        self.create_text(w // 2, self.h // 2, text=text, fill=fg, font=self.font)
+        if clickable is not None:
+            self.configure(cursor="hand2" if clickable else "")
+
+
+class IconTab(tk.Canvas):
+    """A tab drawn as an icon: 'plus' (new meeting) or 'history' (past meetings,
+    a clock inside a counter-clockwise arrow, like a browser's History)."""
+
+    def __init__(self, parent, kind, tip, command):
+        super().__init__(parent, width=px(40), height=px(32), bg=BG, highlightthickness=0,
+                         bd=0, cursor="hand2")
+        self.kind, self.command = kind, command
+        self.selected = self.hover = False
+        self.badge = False
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<Button-1>", lambda e: self.command())
+        Tooltip(self, tip)
+        self.draw()
+
+    def _set_hover(self, on):
+        self.hover = on
+        self.draw()
+
+    def set(self, selected=None, badge=None):
+        if selected is not None:
+            self.selected = selected
+        if badge is not None:
+            self.badge = badge
+        self.draw()
+
+    _glyphs = None
+
+    @classmethod
+    def _glyph(cls, kind):
+        """Windows: the system icon font (smooth at any size). None elsewhere:
+        the drawn icon is used (macOS draws canvas lines smoothly)."""
+        if IS_MAC:
+            return None
+        if cls._glyphs is None:
+            import tkinter.font as tkfont
+            fams = set(tkfont.families())
+            fam = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in fams), None)
+            cls._glyphs = {} if fam is None else {
+                "plus": ((fam, 13), ""), "history": ((fam, 13), "")}
+        return cls._glyphs.get(kind)
+
+    def draw(self):
+        k = UI_SCALE[0]
+        self.delete("all")
+        w, h = int(float(self.cget("width"))), int(float(self.cget("height")))
+        c = FG if (self.selected or self.hover) else MUTED
+        if self.selected or self.hover:                    # crisp underline, no rounded box
+            self.create_rectangle(px(9), h - px(3), w - px(9), h - px(1),
+                                  fill=ACCENT if self.selected else LINE, outline="")
+        glyph = self._glyph(self.kind)
+        if glyph:
+            font, ch = glyph
+            self.create_text(w / 2, h / 2 - px(2), text=ch, fill=c, font=font)
+        elif self.kind == "plus":
+            cx, cy, lw = w / 2, h / 2 - px(2), max(1.5, 1.8 * k)
+            self.create_line(cx - 7 * k, cy, cx + 7 * k, cy, fill=c, width=lw, capstyle="round")
+            self.create_line(cx, cy - 7 * k, cx, cy + 7 * k, fill=c, width=lw, capstyle="round")
+        else:
+            cx, cy, lw, r = w / 2, h / 2 - px(2), max(1.5, 1.8 * k), 8 * k
+            self.create_arc(cx - r, cy - r, cx + r, cy + r, start=210, extent=-300,
+                            style="arc", outline=c, width=lw)
+            ax, ay = cx - r * 0.87, cy + r * 0.5
+            self.create_polygon(ax - 4 * k, ay - 1 * k, ax + 3 * k, ay - 2 * k, ax - 1 * k,
+                                ay + 4 * k, fill=c, outline=c)
+            self.create_line(cx, cy, cx, cy - 4.5 * k, fill=c, width=lw * 0.85, capstyle="round")
+            self.create_line(cx, cy, cx + 3.5 * k, cy + 2 * k, fill=c, width=lw * 0.85,
+                             capstyle="round")
+        if self.badge:                                     # a meeting is recording
+            self.create_text(w - px(9), px(8), text="●", fill=ACCENT, font=(FONT, 6))
+
+
+class InputPill(tk.Canvas):
+    """A rounded input box with a round send button, holding an Entry or Text.
+    set_enabled(False) greys the send button out and ignores clicks on it."""
+
+    def __init__(self, parent, command, parent_bg=BG, radius=21):
+        super().__init__(parent, height=px(44), bg=parent_bg, highlightthickness=0, bd=0)
+        self.command, self.r = command, px(radius)
+        self.inner, self._win = None, None
+        self.enabled = True
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def hold(self, widget):
+        """widget must be created with this pill as its parent."""
+        self.inner = widget
+        self._win = self.create_window(px(18), px(8), window=widget, anchor="nw")
+        widget.bind("<Configure>", lambda e: self.after_idle(self._draw), add="+")
+        self._draw()
+
+    def set_enabled(self, on):
+        if on != self.enabled:
+            self.enabled = on
+            self._draw()
+
+    def _send(self):
+        if self.enabled:
+            self.command()
+
+    def _draw(self):
+        w = max(px(80), self.winfo_width())
+        ih = self.inner.winfo_reqheight() if self.inner else px(22)
+        h = max(px(44), ih + px(18))
+        if int(float(self.cget("height"))) != h:
+            self.configure(height=h)
+        self.delete("shape")
+        round_rect(self, 1, 1, w - 2, h - 2, min(self.r, h // 2), fill=SURFACE, outline=LINE,
+                   tags="shape")
+        cx, cy, rr = w - px(23), h - px(22), px(14)
+        self.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
+                         fill=ACCENT if self.enabled else SURFACE_HI, outline="",
+                         tags=("shape", "send"))
+        self.create_text(cx, cy, text="↑", fill="#ffffff" if self.enabled else FAINT,
+                         font=(FONT, 11, "bold"), tags=("shape", "send"))
+        self.tag_bind("send", "<Button-1>", lambda e: self._send())
+        self.tag_bind("send", "<Enter>",
+                      lambda e: self.configure(cursor="hand2" if self.enabled else ""))
+        self.tag_bind("send", "<Leave>", lambda e: self.configure(cursor=""))
+        if self._win is not None:
+            self.coords(self._win, px(18), (h - ih) // 2)
+            self.itemconfigure(self._win, width=max(px(40), w - px(18) - px(48)))
+
+def fmt_day_iso(iso):
+    """'2026-11-12' -> 'Thu 12 Nov' (with the year if it isn't this year)."""
+    try:
+        d = datetime.date.fromisoformat(iso)
+    except Exception:
+        return iso or ""
+    return fmt_day(d) + ("" if d.year == datetime.date.today().year else f" {d.year}")
 
 
 class Overlay:
@@ -5092,9 +5385,14 @@ class Overlay:
         if IS_MAC:
             # macOS draws a 9 pt Tk font as 9 px; scale up to normal Mac text sizes
             self.root.tk.call("tk", "scaling", MAC_UI_SCALE)
+        try:
+            UI_SCALE[0] = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+        except Exception:
+            UI_SCALE[0] = 1.0
         self.root.title(f"Sidenote {SIDENOTE_VERSION}")
         try:
-            self._icons = [tk.PhotoImage(data=ICON_64), tk.PhotoImage(data=ICON_32)]
+            self._icons = [tk.PhotoImage(data=ICON_256), tk.PhotoImage(data=ICON_64),
+                           tk.PhotoImage(data=ICON_32)]
             self.root.iconphoto(True, *self._icons)
         except Exception as e:
             log.info("Could not set icon: %s", e)
@@ -5120,50 +5418,51 @@ class Overlay:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         pad = 16
-        self.rec = tk.Frame(self.root, bg=BG)      # the Record screen (shown via show_screen)
+        self._build_tabs()                          # ＋ and past meetings, always on top
+        self.rec = tk.Frame(self.root, bg=BG)      # the meeting being recorded
 
         # ---- header ---------------------------------------------------------
         header = tk.Frame(self.rec, bg=BG)
-        header.pack(fill="x", padx=pad, pady=(14, 0))
-        self.menu_btn = tk.Label(header, text="⋯", bg=BG, fg=MUTED, cursor="hand2",
-                                 font=(FONT, 16), padx=6)
-        self.menu_btn.pack(side="right", anchor="n")
-        end_border = tk.Frame(header, bg=LINE, padx=1, pady=1)
-        end_border.pack(side="right", anchor="n", padx=(0, 6), pady=(2, 0))
+        header.pack(fill="x", padx=pad, pady=(px(12), 0))
+        end_border = tk.Frame(header, bg=LINE, padx=1, pady=1)    # (moved to the tab row)
         self.end_btn = tk.Label(end_border, text="End meeting", bg=BG, fg=MUTED, cursor="hand2",
                                 font=(FONT, 9), padx=10, pady=3)
         self.end_btn.pack()
         self.end_btn.bind("<Button-1>", self._end_btn_click)
         self._hover(self.end_btn, BG, SURFACE, fg_on=FG, fg_off=MUTED)
-        self.menu_btn.bind("<Button-1>", self.open_menu)
-        self._hover(self.menu_btn, BG, SURFACE, fg_on=FG, fg_off=MUTED)
 
         titles = tk.Frame(header, bg=BG)
         titles.pack(side="left", fill="x", expand=True)
         self.title_label = tk.Label(titles, text="", bg=BG, fg=FG, anchor="w",
-                                    justify="left", font=(FONT, 13, "bold"))
+                                    justify="left", font=(SERIF, 18))
         self.title_label.pack(fill="x")
         self.title_label.bind("<Button-1>", lambda e: self._edit_info_from_click())
         self.info_label = tk.Label(titles, text="", bg=BG, fg=MUTED, anchor="w",
                                    justify="left", font=(FONT, 9))
         self.info_label.bind("<Button-1>", lambda e: self._edit_info_from_click())
+        pills = tk.Frame(titles, bg=BG)            # ● 12 min · 3 people · captions source
+        pills.pack(fill="x", pady=(px(12), 0))
+        self.p_time = Pill(pills, "", fg=ACCENT_HI)
+        self.p_time.pack(side="left")
+        self.p_people = Pill(pills, "")
+        self.p_people.pack(side="left", padx=(4, 0))
+        self.p_source = Pill(pills, "", command=self._footer_click)
+        self.p_source.pack(side="left", padx=(4, 0))
 
         # View toggles: open lists next to the answer when you want them
         chips = tk.Frame(self.rec, bg=BG)
-        chips.pack(fill="x", padx=pad, pady=(6, 0))
-        self.show_label = tk.Label(chips, text="Show", bg=BG, fg=FAINT, font=(FONT, 8))
-        self.show_label.pack(side="left", padx=(0, 6))
+        chips.pack(fill="x", padx=pad, pady=(px(18), 0))
+        self.show_label = tk.Label(chips, text="", bg=BG)     # (no 'Show' label any more)
         self._compact = False
         self.chips = {}
         for key, label in (("agenda", "Agenda"), ("context", "Context"),
                            ("questions", "To ask"), ("actions", "Actions"),
                            ("transcript", "Transcript")):
-            chip_border = tk.Frame(chips, bg=LINE, padx=1, pady=1)
-            chip_border.pack(side="left", padx=(0, 4))
-            chip = tk.Frame(chip_border, bg=BG, cursor="hand2", padx=6, pady=2)
+            chip_border = tk.Frame(chips, bg=BG, padx=0, pady=0)    # plain text tabs
+            chip_border.pack(side="left", padx=(0, 2))
+            chip = tk.Frame(chip_border, bg=BG, cursor="hand2", padx=8, pady=3)
             chip.pack()
-            box = tk.Label(chip, text="\u2610", bg=BG, fg=MUTED, font=(FONT, 9), cursor="hand2")
-            box.pack(side="left", padx=(0, 3))
+            box = tk.Label(chip, text="", bg=BG)          # (no checkbox glyph any more)
             name = tk.Label(chip, text=label, bg=BG, fg=MUTED, font=(FONT, 9), cursor="hand2")
             name.pack(side="left")
             badge = tk.Label(chip, text="", bg=SURFACE_HI, fg=FG, font=(FONT, 7, "bold"),
@@ -5171,14 +5470,13 @@ class Overlay:
             parts = (chip, box, name, badge)
             for part in parts:
                 part.bind("<Button-1>", lambda e, k=key: self.toggle_panel(k))
-                part.bind("<Enter>", lambda e, b=chip_border: b.configure(bg=MUTED))
-                part.bind("<Leave>", lambda e, b=chip_border, k=key: b.configure(
-                    bg=ACCENT if k in self.visible else LINE))
+                part.bind("<Enter>", lambda e, k=key: self._chip_hover(k, True))
+                part.bind("<Leave>", lambda e, k=key: self._chip_hover(k, False))
             self.chips[key] = {"frame": chip, "border": chip_border, "box": box,
                                "name": name, "badge": badge}
 
         self._divider = tk.Frame(self.rec, bg=LINE, height=1)
-        self._divider.pack(fill="x", padx=pad, pady=(6, 0))
+        self._divider.pack(fill="x", padx=pad, pady=(px(10), 0))
 
         # ---- name question: asked once, inline (no popup, never takes focus) --
         self.name_bar = tk.Frame(self.rec, bg=SURFACE, padx=10, pady=6)
@@ -5215,27 +5513,21 @@ class Overlay:
         self.right_label.bind("<Button-1>", lambda e: self._footer_click())
         self.footer = footer
         self.caption_dot = tk.Label(footer, text="●", bg=BG, fg=FAINT, font=(FONT, 8))
-        self.caption_dot.pack(side="right", padx=(0, 4))
 
         # ---- input ----------------------------------------------------------
-        input_box = tk.Frame(self.rec, bg=SURFACE, highlightthickness=1,
-                             highlightbackground=LINE, highlightcolor=ACCENT)
-        input_box.pack(side="bottom", fill="x", padx=pad, pady=(4, 0))
+        self.input_pill = InputPill(self.rec, self.send)
+        self.input_pill.pack(side="bottom", fill="x", padx=pad, pady=(4, 0))
         # Grows from 1 to 4 lines as you type, then scrolls (Shift+Enter = new line)
-        self.entry = tk.Text(input_box, bg=SURFACE, fg=FG, insertbackground=FG,
+        self.entry = tk.Text(self.input_pill, bg=SURFACE, fg=FG, insertbackground=FG,
                              relief="flat", font=(FONT, 10), borderwidth=0,
                              highlightthickness=0, height=1, wrap="word",
-                             padx=0, pady=8, undo=True)
+                             padx=0, pady=2, undo=True)
+        self.input_pill.hold(self.entry)
         self.entry.bind("<Return>", self._on_return)
         self.entry.bind("<KeyRelease>", lambda e: self._grow_input())
         self.entry.bind("<FocusIn>", self._clear_placeholder)
         self.entry.bind("<FocusOut>", self._show_placeholder)
-        self.send_btn = tk.Label(input_box, text="Ask", bg=ACCENT, fg="#ffffff",
-                                 font=(FONT, 9, "bold"), padx=14, pady=6, cursor="hand2")
-        self.send_btn.pack(side="right", anchor="s", padx=4, pady=4)
-        self.entry.pack(side="left", fill="x", expand=True, padx=(10, 6))
-        self.send_btn.bind("<Button-1>", self.send)
-        self._hover(self.send_btn, ACCENT, ACCENT_HI)
+        self.send_btn = self.input_pill
         self._placeholder_on = False
         self._show_placeholder()
 
@@ -5259,7 +5551,7 @@ class Overlay:
 
         # ---- answer (main content) -------------------------------------------
         self.paned = tk.PanedWindow(self.rec, orient="vertical", bg=BG, bd=0,
-                                    sashwidth=10, sashrelief="flat", showhandle=False,
+                                    sashwidth=px(16), sashrelief="flat", showhandle=False,
                                     opaqueresize=True)
         self.paned.pack(fill="both", expand=True, padx=pad, pady=(8, 0))
         self.panels = {}
@@ -5270,16 +5562,16 @@ class Overlay:
                            ("transcript", "Transcript")):
             frame = tk.Frame(self.paned, bg=BG)
             head = tk.Frame(frame, bg=BG)
-            head.pack(fill="x", pady=(2, 0))
+            head.pack(fill="x", pady=(px(10), 0))
             tk.Label(head, text=title, bg=BG, fg=FG, font=(FONT, 9, "bold"),
                      anchor="w").pack(side="left")
             count = tk.Label(head, text="", bg=BG, fg=FAINT, font=(FONT, 8), anchor="w")
             count.pack(side="left", padx=(8, 0))
             self.panel_count[key] = count
-            tk.Frame(frame, bg=LINE, height=1).pack(fill="x", pady=(5, 0))
+            tk.Frame(frame, bg=LINE, height=1).pack(fill="x", pady=(px(7), px(4)))
             text = tk.Text(frame, wrap="word", bg=BG, fg=FG, relief="flat",
-                           font=(FONT, 9), padx=2, pady=4, borderwidth=0,
-                           highlightthickness=0, spacing1=3, spacing3=3,
+                           font=(FONT, 9), padx=px(4), pady=px(4), borderwidth=0,
+                           highlightthickness=0, spacing1=px(4), spacing3=px(4),
                            cursor="arrow", height=3, selectbackground=SURFACE_HI)
             text.pack(fill="both", expand=True)
             text.tag_configure("muted", foreground=MUTED)
@@ -5302,12 +5594,12 @@ class Overlay:
         body = tk.Frame(self.paned, bg=BG)
         self.paned.add(body, minsize=60, stretch="always")
         self.body = body
-        card = tk.Frame(body, bg=SURFACE)
+        card = tk.Frame(body, bg=BG)                 # answers sit on the background
         card.pack(fill="both", expand=True, pady=(8, 0))
         # The conversation, like in Claude: your message, then Claude's reply.
         # Newest exchange on top; scroll down for the earlier ones.
-        self.answer = tk.Text(card, wrap="word", bg=SURFACE, fg=FG, relief="flat",
-                              font=(FONT, 10), padx=14, pady=10, borderwidth=0,
+        self.answer = tk.Text(card, wrap="word", bg=BG, fg=FG, relief="flat",
+                              font=(FONT, 10), padx=4, pady=10, borderwidth=0,
                               highlightthickness=0, spacing2=2, spacing3=5, cursor="arrow",
                               height=3)
         self.answer.pack(side="left", fill="both", expand=True)
@@ -5318,7 +5610,7 @@ class Overlay:
         self.answer.tag_configure("claude_name", foreground=ACCENT, font=(FONT, 8, "bold"),
                                   spacing1=6, spacing3=2)
         self.answer.tag_configure("time", foreground=FAINT, font=(FONT, 8))
-        self.answer.tag_configure("you", foreground=FG, background=SURFACE_HI,
+        self.answer.tag_configure("you", foreground=FG, background=SURFACE,
                                   lmargin1=0, lmargin2=0)
         self.answer.tag_configure("claude", foreground=FG)
         self.answer.tag_configure("divider", foreground=LINE, font=(FONT, 6),
@@ -5332,13 +5624,14 @@ class Overlay:
 
         self.root.bind("<Configure>", self._on_resize)
         self._set_answer("", empty=True)
-        self.screen = "home"
-        self._build_home()
+        self.screen = None
+        self._build_start()
         self._build_history()
         if live.record_on_open:                  # the user asked Claude to record right away
             self.start_recording()
         else:
-            self.show_screen("home")
+            live.mode = "home"
+            self.select_tab("live")
         self.root.after(300, self.refresh)
 
     # ---- remembered window size and position -------------------------------------
@@ -5450,11 +5743,7 @@ class Overlay:
             chip["frame"].configure(padx=4 if compact else 6)
             chip["box"].configure(font=(FONT, size))
             chip["name"].configure(font=(FONT, size))
-        if compact:
-            self.show_label.pack_forget()
-        elif not self.show_label.winfo_ismapped():
-            self.show_label.pack(side="left", padx=(0, 6),
-                                 before=self.chips["agenda"]["border"])
+        self.show_label.pack_forget()
 
     def _fit_chips(self, width=None):
         """If the four switches don't fit, hide 'Show' and use smaller switches."""
@@ -5522,12 +5811,6 @@ class Overlay:
             if label:
                 a.insert("end", label + "\n", "notice_name")
             a.insert("end", text + "\n", "notice")
-        if not exchanges and not self._notice:
-            no_info = not (transcript.context["title"] or transcript.context["agenda"])
-            hint = ("Add the title, agenda and your role from the title above.  "
-                    if no_info else "")
-            a.insert("end", hint + "Ask anything, e.g. \u201cWhat should I ask now?\u201d "
-                     "or \u201cWhich agenda items haven't we covered?\u201d", "hint")
         for i, ex in enumerate(reversed(exchanges)):      # newest first
             if i or self._notice:
                 a.insert("end", "\u2500" * 12 + "\n", "divider")
@@ -5556,22 +5839,23 @@ class Overlay:
         except Exception:
             return 3
 
-    def _row_height(self, size=9, spacing=6):
+    def _row_height(self, size=9, spacing=None):
         import tkinter.font as tkfont
         cache = getattr(self, "_row_cache", {})
-        if size not in cache:
-            cache[size] = tkfont.Font(family=FONT, size=size).metrics("linespace") + spacing
+        spacing = px(9) if spacing is None else spacing
+        if (size, spacing) not in cache:
+            cache[(size, spacing)] = tkfont.Font(family=FONT, size=size).metrics("linespace") + spacing
             self._row_cache = cache
-        return cache[size]
+        return cache[(size, spacing)]
 
     def _head_height(self, key):
         """Height of a list's title row and divider, measured on screen."""
         frame = self.panels[key]
         try:
             text = self.panel_text[key]
-            return max(24, frame.winfo_reqheight() - text.winfo_reqheight()) + 10
+            return max(px(30), frame.winfo_reqheight() - text.winfo_reqheight()) + px(12)
         except Exception:
-            return 34
+            return px(44)
 
     def _content_height(self, key, max_rows=None):
         """Height that shows every row of a list (measured with the real font,
@@ -5580,6 +5864,8 @@ class Overlay:
         try:
             text.update_idletasks()
             rows = int(text.count("1.0", "end", "displaylines")[0])
+            if text.get("end-2c", "end-1c") == "\n":
+                rows -= 1                     # the empty line after the last item
         except Exception:
             rows = 3
         if key == "transcript":
@@ -5587,7 +5873,7 @@ class Overlay:
         rows = max(1, rows)
         if max_rows:
             rows = min(rows, max_rows)
-        return self._head_height(key) + rows * self._row_height() + 8
+        return self._head_height(key) + rows * self._row_height() + px(10)
 
     def _answer_needed(self, total):
         return max(self._row_height(10, 8) * 2 + 40,
@@ -5606,9 +5892,9 @@ class Overlay:
                 return
             self.paned.update_idletasks()
             total = max(300, self.paned.winfo_height())
-            answer_needed = self._answer_needed(total)
+            answer_needed = max(self._answer_needed(total), int(total * 0.34))
             wanted = {k: self._content_height(k) for k in self.visible}
-            gaps = 10 * len(self.visible)
+            gaps = px(16) * len(self.visible)
             free = total - answer_needed - gaps
             if sum(wanted.values()) <= free:
                 # everything fits: lists show all rows, the answer gets the rest
@@ -5617,17 +5903,18 @@ class Overlay:
                 self.paned.paneconfigure(self.body, stretch="always",
                                          height=total - sum(wanted.values()) - gaps)
             else:
-                # not enough room: lists get priority (at least 3 rows each, they
-                # scroll), the answer keeps what its text needs
-                floor = {k: self._content_height(k, max_rows=3) for k in self.visible}
-                extra = max(0, free - sum(floor.values()))
-                need_more = {k: wanted[k] - floor[k] for k in self.visible}
-                more_total = sum(need_more.values()) or 1
-                heights = {k: floor[k] + int(extra * need_more[k] / more_total)
-                           for k in self.visible}
-                if sum(floor.values()) > free:     # very small window: shrink the answer
-                    answer_needed = max(70, total - sum(floor.values()) - gaps)
-                    heights = floor
+                # not enough room: the answer keeps a third of the window; open
+                # lists share the rest (at least two rows each) and scroll inside
+                floor = {k: self._content_height(k, max_rows=2) for k in self.visible}
+                if sum(floor.values()) > free:     # many lists, small window: equal shares
+                    share = max(px(60), free // len(self.visible))
+                    heights = {k: share for k in self.visible}
+                else:
+                    extra = free - sum(floor.values())
+                    need_more = {k: wanted[k] - floor[k] for k in self.visible}
+                    more_total = sum(need_more.values()) or 1
+                    heights = {k: floor[k] + int(extra * need_more[k] / more_total)
+                               for k in self.visible}
                 self.paned.paneconfigure(self.body, stretch="never", height=answer_needed)
                 for k in self.visible:
                     self.paned.paneconfigure(self.panels[k], stretch="always",
@@ -5644,9 +5931,9 @@ class Overlay:
         with transcript.lock:
             c = dict(transcript.context)
         title = c["title"] or c["subject"]
-        if getattr(self, "screen", "record") != "record":
-            self.root.title(f"Sidenote {SIDENOTE_VERSION}"
-                            + (" - History" if self.screen == "history" else ""))
+        if live.mode != "record":
+            self.root.title(f"Sidenote {SIDENOTE_VERSION}" + (
+                " - Past meetings" if getattr(self, "screen", None) == "meetings" else ""))
             return
         self.title_label.configure(text=title or "Untitled meeting",
                                    fg=FG if title else MUTED, cursor="hand2")
@@ -5679,25 +5966,84 @@ class Overlay:
         self._update_name_bar()
         self.toast("You can add your name later in ⋯ > Meeting info")
 
+    MENU_GLYPHS = {"info": "", "captions": "", "folder": "", "new": ""}
+
     def open_menu(self, event=None):
-        menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=FG, activebackground=ACCENT,
-                       activeforeground="#ffffff", bd=0, font=(FONT, 9))
-        menu.bind("<Unmap>", lambda e: setattr(self, "_menu_closed_at", time.time()))
-        menu.add_command(label="Meeting info...", command=self.edit_info)
-        menu.add_command(label="Home", command=self.go_home)
-        menu.add_command(label="Meeting history", command=self.go_history)
-        menu.add_command(label="Hide Live Captions" if not captions_win.hide_wanted
-                         else "Show Live Captions", command=self.toggle_captions)
-        menu.add_command(label="Open meetings folder", command=self.open_folder)
-        menu.add_separator()
-        menu.add_command(label="New meeting...", command=self.new_meeting)
-        x = self.menu_btn.winfo_rootx()
-        y = self.menu_btn.winfo_rooty() + self.menu_btn.winfo_height()
-        try:
-            menu.tk_popup(x - 150, y)
-        finally:
-            menu.grab_release()
-            self._menu_closed_at = time.time()
+        """The ⋯ menu: a small dark panel under the button (not the system menu)."""
+        if getattr(self, "_menu_win", None) is not None:
+            self._close_menu()
+            return
+        recording = live.mode == "record" and not transcript.ended_at
+        meeting = live.mode == "record"
+        items = [
+            ("info", "Meeting info", self.edit_info, meeting),
+            ("captions", "Show Live Captions" if captions_win.hide_wanted else "Hide Live Captions",
+             self.toggle_captions, recording),
+            ("folder", "Open meetings folder", self.open_folder, True),
+            None,
+            ("new", "New meeting", self.new_meeting, True),
+        ]
+        win = tk.Toplevel(self.root)
+        win.wm_overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=LINE)
+        panel = tk.Frame(win, bg=SURFACE, padx=px(6), pady=px(6))
+        panel.pack(padx=1, pady=1)
+        glyph_font = IconTab._glyph("plus")
+        for item in items:
+            if item is None:
+                tk.Frame(panel, bg=LINE, height=1).pack(fill="x", pady=px(5), padx=px(6))
+                continue
+            key, label, command, enabled = item
+            row = tk.Frame(panel, bg=SURFACE, padx=px(10), pady=px(7),
+                           cursor="hand2" if enabled else "")
+            row.pack(fill="x")
+            parts = [row]
+            fg = FG if enabled else FAINT
+            if glyph_font:
+                ic = tk.Label(row, text=self.MENU_GLYPHS[key], bg=SURFACE, fg=MUTED if enabled else FAINT,
+                              font=(glyph_font[0][0], 10), width=2, anchor="w")
+                ic.pack(side="left", padx=(0, px(8)))
+                parts.append(ic)
+            lab = tk.Label(row, text=label, bg=SURFACE, fg=fg, font=(FONT, 10), anchor="w")
+            lab.pack(side="left", fill="x", expand=True)
+            parts.append(lab)
+            if not enabled:
+                continue
+            for w in parts:
+                w.bind("<Enter>", lambda e, ps=parts: [p.configure(bg=SURFACE_HI) for p in ps])
+                w.bind("<Leave>", lambda e, ps=parts: [p.configure(bg=SURFACE) for p in ps])
+                w.bind("<ButtonRelease-1>", lambda e, c=command: (self._close_menu(), c()))
+        win.update_idletasks()
+        x = self.menu_btn.winfo_rootx() + self.menu_btn.winfo_width() - win.winfo_reqwidth()
+        y = self.menu_btn.winfo_rooty() + self.menu_btn.winfo_height() + px(4)
+        win.geometry(f"+{max(0, x)}+{y}")
+        self._menu_win = win
+        win.bind("<Escape>", lambda e: self._close_menu())
+        win.bind("<Button-1>", self._menu_click)
+        win.grab_set()                               # a click anywhere else closes it
+        win.focus_force()
+
+    def _menu_click(self, event):
+        win = self._menu_win
+        if win is None:
+            return
+        x, y = event.x_root, event.y_root
+        inside = (win.winfo_rootx() <= x < win.winfo_rootx() + win.winfo_width()
+                  and win.winfo_rooty() <= y < win.winfo_rooty() + win.winfo_height())
+        if not inside:
+            self._close_menu()
+
+    def _close_menu(self):
+        win = getattr(self, "_menu_win", None)
+        self._menu_win = None
+        self._menu_closed_at = time.time()
+        if win is not None:
+            try:
+                win.grab_release()
+                win.destroy()
+            except Exception:
+                pass
 
     def _edit_info_from_click(self):
         # A click outside the open menu closes it; don't let that same click
@@ -5925,7 +6271,7 @@ class Overlay:
                 "and everything is saved in the meeting file.", parent=self.root):
             return
         transcript.end_meeting()
-        self.end_btn.configure(text="\u2190 Home", fg=MUTED, cursor="hand2")
+        self.end_btn.configure(text="New meeting", fg=MUTED, cursor="hand2")
         connected = live.waiting or live.label().startswith("Claude")
         if connected:
             question_queue.put(END_TOKEN)
@@ -5935,30 +6281,136 @@ class Overlay:
                              "so there's no recap yet. Type 'recap the meeting' in the "
                              "Claude app to add one.")
 
-    # ---- screens: Home, History, Record ------------------------------------------------
-    def show_screen(self, name):
-        for frame in (self.rec, self.home, self.hist):
+    # ---- tabs: ＋ (new / current meeting) and past meetings --------------------------
+    MEETINGS_MIN_WIDTH = 760      # the past-meetings tab needs room for the side list
+
+    def _build_tabs(self):
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(side="top", fill="x", padx=12, pady=(10, 0))
+        self.tab_live = IconTab(bar, "plus", "New meeting", lambda: self.select_tab("live"))
+        self.tab_live.pack(side="left")
+        self.tab_past = IconTab(bar, "history", "Past meetings",
+                                lambda: self.select_tab("meetings"))
+        self.tab_past.pack(side="left", padx=(4, 0))
+        self.menu_btn = tk.Label(bar, text="⋯", bg=BG, fg=MUTED, cursor="hand2",
+                                 font=(FONT, 15), padx=6)
+        self.menu_btn.pack(side="right")
+        self.menu_btn.bind("<Button-1>", self.open_menu)
+        self._hover(self.menu_btn, BG, SURFACE, fg_on=FG, fg_off=MUTED)
+        # End meeting (dark red) while recording; New meeting after it ended
+        self.top_btn = Pill(bar, "", fg="#ffffff", bg=END_RED, size=9, height=28,
+                            command=self._top_btn_click)
+        self.top_btn.bind("<Enter>", lambda e: self._sync_top_btn(hover=True))
+        self.top_btn.bind("<Leave>", lambda e: self._sync_top_btn(hover=False))
+        self._top_state = None
+        self.tab_bar = bar
+
+    def _top_btn_click(self):
+        if live.mode == "record" and not transcript.ended_at:
+            self.end_meeting()
+        elif live.mode == "record":
+            self.start_recording()
+
+    def _sync_top_btn(self, hover=False):
+        if live.mode == "record" and not transcript.ended_at:
+            state = ("End meeting", "#ffffff", END_RED_HI if hover else END_RED)
+        elif live.mode == "record" and self.screen == "live":
+            state = ("New meeting", FG, SURFACE_HI if hover else SURFACE)
+        else:
+            state = None
+        if state == self._top_state:
+            return
+        self._top_state = state
+        if state is None:
+            self.top_btn.pack_forget()
+            return
+        self.top_btn.set(*state)
+        if not self.top_btn.winfo_ismapped():
+            self.top_btn.pack(side="right", padx=(0, px(8)))
+
+    def select_tab(self, name):
+        """'live' (the ＋ tab) or 'meetings'. Recording goes on in the background."""
+        recording = live.mode == "record"
+        for frame in (self.rec, self.start, self.hist):
             frame.pack_forget()
-        {"record": self.rec, "home": self.home, "history": self.hist}[name].pack(
-            fill="both", expand=True)
+        if name == "live":
+            (self.rec if recording else self.start).pack(fill="both", expand=True)
+            if not recording:
+                live.mode = "home"
+        else:
+            self.hist.pack(fill="both", expand=True)
+            if not recording:
+                live.mode = "history"
+        prev = getattr(self, "screen", None)
         self.screen = name
-        if name != "record":
-            live.mode = name
+        self.tab_live.set(selected=name == "live")
+        self.tab_past.set(selected=name == "meetings")
         live.last_activity = time.time()
-        if name == "history":
+        if name == "meetings":
+            self._widen()
             self.history_render(reload=True)
-        if name == "home":
-            self._home_refresh()
+        elif prev == "meetings":
+            self._narrow()
         self.update_info()
 
+    def _widen(self):
+        self.root.update_idletasks()
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        if w >= px(self.MEETINGS_MIN_WIDTH):
+            self._narrow_to = None
+            return
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        new_w = px(self.MEETINGS_MIN_WIDTH)
+        x = max(0, min(x, self.root.winfo_screenwidth() - new_w - 10))
+        self._narrow_to = (w, self.root.winfo_x())
+        self.root.geometry(f"{new_w}x{h}+{x}+{y}")
+
+    def _narrow(self):
+        back = getattr(self, "_narrow_to", None)
+        self._narrow_to = None
+        if not back:
+            return
+        self.root.update_idletasks()
+        if abs(self.root.winfo_width() - px(self.MEETINGS_MIN_WIDTH)) > px(4):
+            return                                   # the user resized it: leave it
+        w, x = back
+        self.root.geometry(f"{w}x{self.root.winfo_height()}+{x}+{self.root.winfo_y()}")
+
+    # ---- ＋ tab when nothing is recording -------------------------------------------
+    def _build_start(self):
+        self.start = tk.Frame(self.root, bg=BG)
+        inner = tk.Frame(self.start, bg=BG)
+        inner.place(relx=0.5, rely=0.42, anchor="center", relwidth=0.86)
+        tk.Label(inner, text="New meeting", bg=BG, fg=FG, font=(SERIF, 22),
+                 anchor="w").pack(fill="x")
+        self.start_sub = tk.Label(
+            inner, text="Sidenote reads your call's captions, keeps the agenda and action "
+                        "items, and answers your questions.", bg=BG, fg=MUTED, font=(FONT, 10),
+            anchor="w", justify="left", wraplength=px(330))
+        self.start_sub.pack(fill="x", pady=(6, 22))
+        btn = Pill(inner, "●  Start meeting", fg="#ffffff", bg=ACCENT, size=11,
+                   height=40, command=self.start_recording)
+        btn.pack(anchor="w")
+        btn.bind("<Enter>", lambda e: btn.set("●  Start meeting", "#ffffff", ACCENT_HI))
+        btn.bind("<Leave>", lambda e: btn.set("●  Start meeting", "#ffffff", ACCENT))
+        tk.Label(inner, text="Works with Google Meet, Zoom (browser), Microsoft Teams and "
+                             "Live Captions.", bg=BG, fg=FAINT, font=(FONT, 8), anchor="w",
+                 justify="left", wraplength=px(330)).pack(fill="x", pady=(14, 0))
+        self.start_offline = tk.Label(inner, text="Claude is not connected \u00b7 type "
+                                                  "\u201copen Sidenote\u201d in a Claude chat",
+                                      bg=BG, fg=FAINT, font=(FONT, 9), anchor="w", justify="left",
+                                      wraplength=px(330))
+        self._start_offline_shown = False
+
     def start_recording(self, info=None):
-        """Record a meeting (from Home, History, the menu or open_sidenote)."""
-        if self._h_waiting:                          # a History question is being answered
+        """Start a meeting (＋ tab, the menu, or Claude when the user asked)."""
+        if self._h_waiting:                          # a past-meetings question is pending
             live.answer_target = "dropped"
             self._h_waiting = False
-            self._h_chat.append(("note", "Recording started: that question was cancelled."))
+            self._h_chat.append(("note", "A meeting started: that question was cancelled."))
+            self._h_render_chat()
         kept = []
-        while True:                                  # drop History questions not taken yet
+        while True:                                  # drop past-meetings questions not taken
             try:
                 item = question_queue.get_nowait()
             except queue.Empty:
@@ -5980,18 +6432,12 @@ class Overlay:
             captions_win.ensure_running()            # Live Captions only while recording
         except Exception as e:
             log.info("Could not start Live Captions: %s", e)
-        self.show_screen("record")
-        self._reset_view("Recording started")
-
-    def go_home(self, _e=None):
-        if live.mode == "record" and not transcript.ended_at and transcript.count_lines():
-            self.toast("End the meeting first (End meeting, top right)")
-            return
-        self.show_screen("home")
+        self.select_tab("live")
+        self._reset_view("Meeting started")
 
     def _end_btn_click(self, _e=None):
         if transcript.ended_at:
-            self.go_home()
+            self.start_recording()                   # after a meeting: start the next one
         else:
             self.end_meeting()
 
@@ -6008,153 +6454,83 @@ class Overlay:
         except Exception:
             pass
 
-    def _card(self, parent, title, subtitle, command, accent=False):
-        border = tk.Frame(parent, bg=ACCENT if accent else LINE, padx=1, pady=1)
-        border.pack(fill="x", pady=(0, 10))
-        box = tk.Frame(border, bg=SURFACE, padx=14, pady=12, cursor="hand2")
-        box.pack(fill="x")
-        t = tk.Label(box, text=title, bg=SURFACE, fg=ACCENT if accent else FG, anchor="w",
-                     font=(FONT, 11, "bold"), cursor="hand2")
-        t.pack(fill="x")
-        sub = tk.Label(box, text=subtitle, bg=SURFACE, fg=MUTED, anchor="w", justify="left",
-                       font=(FONT, 9), cursor="hand2")
-        sub.pack(fill="x", pady=(2, 0))
-        for w in (box, t, sub):
-            w.bind("<Button-1>", lambda e: command())
-            w.bind("<Enter>", lambda e: [x.configure(bg=SURFACE_HI) for x in (box, t, sub)])
-            w.bind("<Leave>", lambda e: [x.configure(bg=SURFACE) for x in (box, t, sub)])
-        return sub
-
-    def _offline_row(self, parent):
-        """'Claude isn't connected' + a one-click copy of 'open Sidenote'."""
-        row = tk.Frame(parent, bg=BG)
-        tk.Label(row, text="Claude isn't connected. Paste this into a Claude chat:", bg=BG,
-                 fg=WARN, font=(FONT, 9), anchor="w").pack(side="left")
-        copy = tk.Label(row, text="Copy “open Sidenote”", bg=SURFACE, fg=FG,
-                        font=(FONT, 9, "bold"), padx=8, pady=2, cursor="hand2")
-        copy.pack(side="left", padx=(8, 0))
+    def _offline_row(self, parent, bg=BG):
+        """'Claude isn't connected' + one click to copy 'open Sidenote'."""
+        row = tk.Frame(parent, bg=bg)
+        tk.Label(row, text="Claude isn't connected ·", bg=bg, fg=WARN,
+                 font=(FONT, 9)).pack(side="left")
+        copy = tk.Label(row, text="Copy “open Sidenote”", bg=bg, fg=ACCENT_HI,
+                        font=(FONT, 9, "underline"), cursor="hand2")
+        copy.pack(side="left", padx=(6, 0))
         copy.bind("<Button-1>", self._copy_open_line)
-        self._hover(copy, SURFACE, SURFACE_HI)
+        Tooltip(copy, "Paste it into a Claude chat to connect")
         return row
 
-    def _build_home(self):
-        self.home = tk.Frame(self.root, bg=BG)
-        inner = tk.Frame(self.home, bg=BG)
-        inner.pack(fill="both", expand=True, padx=20, pady=(28, 8))
-        tk.Label(inner, text="Sidenote", bg=BG, fg=FG, font=(FONT, 18, "bold"),
-                 anchor="w").pack(fill="x")
-        tk.Label(inner, text="Notes and answers for your meetings, with Claude.", bg=BG,
-                 fg=MUTED, font=(FONT, 9), anchor="w").pack(fill="x", pady=(2, 22))
-        self._card(inner, "●  Record a meeting",
-                   "Live captions, agenda, action items and answers during a call",
-                   self.start_recording, accent=True)
-        self.home_hist_sub = self._card(inner, "History", "Your saved meetings",
-                                        lambda: self.show_screen("history"))
-        self.home_offline = self._offline_row(inner)
-        self._home_offline_shown = False
-
-    def _home_refresh(self):
-        try:
-            entries = history_index()
-            opened = sum(_open_actions(e) for e in entries)
-            self.home_hist_sub.configure(
-                text=f"{len(entries)} saved meeting(s)"
-                     + (f" · {opened} open action item(s)" if opened else "")
-                     + " · browse and ask Claude about them")
-        except Exception as e:
-            log.info("History not readable: %s", e)
-
+    # ---- past meetings: list on the left, the meeting in the center ----------------------
     def _build_history(self):
         self.hist = tk.Frame(self.root, bg=BG)
-        pad = 16
-        top = tk.Frame(self.hist, bg=BG)
-        top.pack(fill="x", padx=pad, pady=(14, 0))
-        back = tk.Label(top, text="← Home", bg=BG, fg=MUTED, cursor="hand2", font=(FONT, 9))
-        back.pack(side="left")
-        back.bind("<Button-1>", self.go_home)
-        self._hover(back, BG, BG, fg_on=FG, fg_off=MUTED)
-        tk.Label(top, text="History", bg=BG, fg=FG, font=(FONT, 13, "bold")).pack(
-            side="left", padx=(12, 0))
-        rec = tk.Label(top, text="● Record", bg=ACCENT, fg="#ffffff", cursor="hand2",
-                       font=(FONT, 9, "bold"), padx=10, pady=3)
-        rec.pack(side="right")
-        rec.bind("<Button-1>", lambda e: self.start_recording())
-        self._hover(rec, ACCENT, ACCENT_HI)
+        side = tk.Frame(self.hist, bg=BG, width=px(240))
+        side.pack(side="left", fill="y", padx=(px(10), 0), pady=(px(8), 0))
+        side.pack_propagate(False)
+        self.h_list = tk.Text(side, wrap="none", bg=BG, fg=FG, relief="flat", font=(FONT, 9),
+                              padx=px(4), pady=px(2), borderwidth=0, highlightthickness=0,
+                              cursor="arrow")
+        self.h_list.pack(fill="both", expand=True)
+        L = self.h_list
+        L.tag_configure("group", foreground=FAINT, font=(FONT, 8, "bold"), lmargin1=px(10),
+                        spacing1=px(26), spacing3=px(8))
+        L.tag_configure("row_title", foreground=FG, font=(FONT, 9, "bold"), lmargin1=px(10),
+                        spacing1=px(7))
+        L.tag_configure("row_meta", foreground=FAINT, font=(FONT, 8), lmargin1=px(10),
+                        spacing1=px(2), spacing3=px(7))
+        L.tag_configure("hover", background=SURFACE)
+        L.tag_configure("picked", background=SURFACE_HI)      # the meeting shown in the center
+        L.tag_raise("picked")
+        L.configure(state="disabled")
+        tk.Frame(self.hist, bg=LINE, width=1).pack(side="left", fill="y", padx=(px(6), 0),
+                                                   pady=(px(8), 0))
 
-        search = tk.Frame(self.hist, bg=SURFACE, highlightthickness=1, highlightbackground=LINE,
-                          highlightcolor=ACCENT)
-        search.pack(fill="x", padx=pad, pady=(10, 0))
-        self.h_search = tk.Entry(search, bg=SURFACE, fg=FG, insertbackground=FG, relief="flat",
-                                 font=(FONT, 10), borderwidth=0, highlightthickness=0)
-        self.h_search.pack(fill="x", padx=8, ipady=5)
-        self.h_search.bind("<KeyRelease>", lambda e: self._h_schedule())
-
-        filters = tk.Frame(self.hist, bg=BG)
-        filters.pack(fill="x", padx=pad, pady=(6, 0))
-        self.h_range = "all"
-        self.h_open_only = False
-        self.h_filter_labels = {}
-        for key, label in (("7", "Last 7 days"), ("30", "Last 30 days"), ("all", "All")):
-            lab = tk.Label(filters, text=label, bg=BG, fg=MUTED, font=(FONT, 8), padx=6, pady=2,
-                           cursor="hand2")
-            lab.pack(side="left", padx=(0, 4))
-            lab.bind("<Button-1>", lambda e, k=key: self._h_set_range(k))
-            self.h_filter_labels[key] = lab
-        self.h_open_lab = tk.Label(filters, text="☐ Open action items", bg=BG, fg=MUTED,
-                                   font=(FONT, 8), padx=6, pady=2, cursor="hand2")
-        self.h_open_lab.pack(side="right")
-        self.h_open_lab.bind("<Button-1>", lambda e: self._h_toggle_open())
-        self._h_paint_filters()
-
-        # chat (bottom): ask Claude about this meeting or all meetings
-        chat = tk.Frame(self.hist, bg=BG)
-        chat.pack(side="bottom", fill="x", padx=pad, pady=(6, 0))
-        head = tk.Frame(chat, bg=BG)
-        head.pack(fill="x")
-        tk.Label(head, text="Ask Claude about", bg=BG, fg=FG, font=(FONT, 9, "bold")).pack(
-            side="left")
-        self.h_scope_lab = tk.Label(head, text="", bg=BG, fg=ACCENT, cursor="hand2",
-                                    font=(FONT, 9, "underline"))
-        self.h_scope_lab.pack(side="left", padx=(6, 0))
-        self.h_scope_lab.bind("<Button-1>", lambda e: self._h_toggle_scope())
-        self.h_offline = self._offline_row(chat)
-        self._h_offline_shown = False
-        self.h_chat_text = tk.Text(chat, wrap="word", bg=SURFACE, fg=FG, relief="flat",
-                                   font=(FONT, 9), padx=10, pady=6, borderwidth=0,
-                                   highlightthickness=0, height=5, cursor="arrow",
-                                   spacing1=2, spacing3=3)
-        self.h_chat_text.pack(fill="x", pady=(4, 0))
-        for tag, opts in (("you", {"foreground": MUTED, "font": (FONT, 9, "bold")}),
-                          ("claude_name", {"foreground": ACCENT, "font": (FONT, 8, "bold")}),
-                          ("hint", {"foreground": FAINT}), ("note", {"foreground": WARN})):
-            self.h_chat_text.tag_configure(tag, **opts)
-        box = tk.Frame(chat, bg=SURFACE, highlightthickness=1, highlightbackground=LINE,
-                       highlightcolor=ACCENT)
-        box.pack(fill="x", pady=(6, 0))
-        self.h_entry = tk.Entry(box, bg=SURFACE, fg=FG, insertbackground=FG, relief="flat",
-                                font=(FONT, 10), borderwidth=0, highlightthickness=0)
-        self.h_entry.pack(side="left", fill="x", expand=True, padx=8, ipady=6)
+        main = tk.Frame(self.hist, bg=BG)
+        main.pack(side="left", fill="both", expand=True, padx=(px(22), px(16)), pady=(px(8), 0))
+        self.h_main = main
+        # the ask box is always at the bottom
+        ask = tk.Frame(main, bg=BG)
+        ask.pack(side="bottom", fill="x", pady=(px(8), 0))
+        self.h_pill = InputPill(ask, self.history_ask)
+        self.h_pill.pack(fill="x")
+        self.h_entry = tk.Entry(self.h_pill, bg=SURFACE, fg=FG, insertbackground=FG,
+                                relief="flat", font=(FONT, 10), borderwidth=0, highlightthickness=0,
+                                disabledbackground=SURFACE, disabledforeground=FAINT)
+        self.h_pill.hold(self.h_entry)
         self.h_entry.bind("<Return>", lambda e: self.history_ask())
-        ask = tk.Label(box, text="Ask", bg=ACCENT, fg="#ffffff", font=(FONT, 9, "bold"),
-                       padx=14, pady=5, cursor="hand2")
-        ask.pack(side="right", padx=4, pady=4)
-        ask.bind("<Button-1>", lambda e: self.history_ask())
-        self._hover(ask, ACCENT, ACCENT_HI)
-
-        body = tk.Frame(self.hist, bg=BG)
-        body.pack(fill="both", expand=True, padx=pad, pady=(8, 0))
-        self.h_text = tk.Text(body, wrap="word", bg=BG, fg=FG, relief="flat", font=(FONT, 9),
-                              padx=2, pady=4, borderwidth=0, highlightthickness=0,
-                              cursor="arrow", spacing1=2, spacing3=2)
-        self.h_text.pack(fill="both", expand=True)
+        self.h_entry.bind("<FocusIn>", lambda e: self._h_placeholder(False))
+        self.h_entry.bind("<FocusOut>", lambda e: self._h_placeholder(True))
+        self._h_ph_on = False
+        self._h_offline = False
+        # the meeting (top) and the conversation with Claude (bottom, when there is one)
+        self.h_paned = tk.PanedWindow(main, orient="vertical", bg=BG, bd=0, sashwidth=px(10),
+                                      sashrelief="flat", showhandle=False, opaqueresize=True)
+        self.h_paned.pack(fill="both", expand=True)
+        self.h_text = tk.Text(self.h_paned, wrap="word", bg=BG, fg=FG, relief="flat",
+                              font=(FONT, 10), padx=px(6), pady=px(4), borderwidth=0,
+                              highlightthickness=0, cursor="arrow", spacing1=px(3),
+                              spacing2=px(3), spacing3=px(3))
+        self.h_paned.add(self.h_text, stretch="always", minsize=px(120))
         t = self.h_text
-        t.tag_configure("title", font=(FONT, 10, "bold"), foreground=FG)
-        t.tag_configure("big", font=(FONT, 12, "bold"), foreground=FG, spacing3=2)
+        t.tag_configure("big", font=(SERIF, 19), foreground=FG, spacing3=px(10))
         t.tag_configure("meta", foreground=FAINT, font=(FONT, 8))
+        t.tag_configure("people", foreground=FAINT, font=(FONT, 8), spacing1=px(8))
         t.tag_configure("muted", foreground=MUTED)
-        t.tag_configure("badge", foreground=ACCENT, font=(FONT, 8, "bold"))
-        t.tag_configure("section", foreground=FG, font=(FONT, 9, "bold"), spacing1=8)
-        t.tag_configure("link", foreground=ACCENT, underline=True)
+        t.tag_configure("section", foreground=MUTED, font=(FONT, 9, "bold"), spacing1=px(24),
+                        spacing3=px(8))
+        t.tag_configure("item", lmargin1=px(4), lmargin2=px(28), spacing1=px(4), spacing3=px(4))
+        t.tag_configure("bullet", lmargin1=px(4), lmargin2=px(20), spacing1=px(3), spacing3=px(3))
+        t.tag_configure("meta_line", lmargin1=px(30), lmargin2=px(30), spacing3=px(6))
+        t.tag_configure("dec_meeting", foreground=ACCENT_HI, font=(FONT, 9, "bold"),
+                        spacing1=px(12), lmargin1=px(4))
+        t.tag_configure("dec_date", spacing1=px(12))
+        t.tag_configure("dec_item", lmargin1=px(14), lmargin2=px(30))
+        t.tag_configure("link", foreground=ACCENT_HI)
         t.tag_configure("check", foreground=OK)
         t.tag_configure("box", foreground=MUTED)
         t.tag_configure("done", foreground=FAINT, overstrike=True)
@@ -6162,189 +6538,305 @@ class Overlay:
         t.tag_configure("hover", background=SURFACE)
         t.tag_configure("faint", foreground=FAINT)
         t.configure(state="disabled")
-        self.h_selected = None           # meeting id open in detail view (None = list)
-        self.h_scope_all = True          # chat scope: all meetings / the selected one
+        # the conversation panel
+        self.h_chat = tk.Frame(self.h_paned, bg=BG)
+        tk.Frame(self.h_chat, bg=LINE, height=1).pack(fill="x")
+        head = tk.Frame(self.h_chat, bg=BG)
+        head.pack(fill="x", pady=(px(8), px(2)))
+        tk.Label(head, text="Conversation", bg=BG, fg=MUTED, font=(FONT, 9, "bold")).pack(side="left")
+        clear = tk.Label(head, text="Clear", bg=BG, fg=FAINT, font=(FONT, 8), cursor="hand2")
+        clear.pack(side="right")
+        clear.bind("<Button-1>", lambda e: self._h_clear_chat())
+        self._hover(clear, BG, BG, fg_on=FG, fg_off=FAINT)
+        self.h_chat_text = tk.Text(self.h_chat, wrap="word", bg=BG, fg=FG, relief="flat",
+                                   font=(FONT, 10), padx=px(6), pady=px(4), borderwidth=0,
+                                   highlightthickness=0, cursor="arrow", spacing2=px(3))
+        self.h_chat_text.pack(fill="both", expand=True)
+        c = self.h_chat_text
+        c.tag_configure("you_name", foreground=MUTED, font=(FONT, 8, "bold"), spacing1=px(14))
+        c.tag_configure("you", foreground=FG, font=(FONT, 10, "bold"), spacing3=px(4))
+        c.tag_configure("claude_name", foreground=ACCENT, font=(FONT, 8, "bold"), spacing1=px(10))
+        c.tag_configure("claude", foreground=FG, spacing3=px(4))
+        c.tag_configure("hint", foreground=FAINT, spacing1=px(10))
+        c.tag_configure("note", foreground=WARN, spacing1=px(10))
+        self._h_chat_shown = False
+        self.h_selected = None           # meeting id shown in the center (None = All meetings)
+        self.h_range = "all"             # All meetings filter: all, day, 7, 30
+        self.h_all_expanded = False      # show all action items, not just ten
         self.h_show_transcript = False
         self._h_chat = []                # [(who, text)] who: you, claude, note
         self._h_waiting = False
-        self._h_job = None
         self._h_entries = []
-        self._h_paint_scope()
+        self._h_pills = []
+        self._h_placeholder(True)
 
-    # -- History: filters and list ---------------------------------------------------
-    def _h_paint_filters(self):
-        for key, lab in self.h_filter_labels.items():
-            on = key == self.h_range
-            lab.configure(bg=SURFACE_HI if on else BG, fg=FG if on else MUTED)
-        self.h_open_lab.configure(text=("☑" if self.h_open_only else "☐")
-                                  + " Open action items",
-                                  fg=FG if self.h_open_only else MUTED)
+    def _h_placeholder(self, on):
+        """Placeholder in the ask box (or 'Claude is not connected', box disabled)."""
+        e = self.h_entry
+        if self._h_offline:
+            e.configure(state="normal")
+            e.delete(0, "end")
+            e.insert(0, "Claude is not connected")
+            e.configure(state="disabled")
+            self._h_ph_on = True
+            return
+        text = "Ask about this meeting" if self.h_selected else "Ask about all your meetings"
+        if on and (self._h_ph_on or not e.get().strip()):
+            e.delete(0, "end")
+            e.insert(0, text)
+            e.configure(fg=FAINT)
+            self._h_ph_on = True
+        elif not on and self._h_ph_on:
+            e.delete(0, "end")
+            e.configure(fg=FG)
+            self._h_ph_on = False
 
-    def _h_set_range(self, key):
-        self.h_range = key
-        self._h_paint_filters()
-        self.history_render()
-
-    def _h_toggle_open(self):
-        self.h_open_only = not self.h_open_only
-        self._h_paint_filters()
-        self.history_render()
-
-    def _h_schedule(self):
-        if self._h_job:
-            self.root.after_cancel(self._h_job)
-        self._h_job = self.root.after(250, self.history_render)
-
-    def _h_filtered(self):
-        text = self.h_search.get().strip()
-        since = ""
-        if self.h_range in ("7", "30"):
-            since = (datetime.date.today() - datetime.timedelta(days=int(self.h_range))).isoformat()
-        return [e for e in self._h_entries
-                if (not since or e["date"] >= since)
-                and (not self.h_open_only or _open_actions(e))
-                and (not text or _words_in(text, _meeting_text(e)))]
+    def _h_set_offline(self, offline):
+        """Claude not connected: the box says so and the send button is greyed out."""
+        if offline == self._h_offline:
+            return
+        self._h_offline = offline
+        self.h_pill.set_enabled(not offline)
+        if not offline:
+            self.h_entry.configure(state="normal")
+            self.h_entry.delete(0, "end")
+            self._h_ph_on = False
+            if self.root.focus_get() is not self.h_entry:
+                self._h_placeholder(True)
+            else:
+                self.h_entry.configure(fg=FG)
+        else:
+            self._h_placeholder(True)
 
     def history_render(self, reload=False):
         if reload or not self._h_entries:
             try:
                 self._h_entries = history_index()
             except Exception as e:
-                log.info("History not readable: %s", e)
+                log.info("Past meetings not readable: %s", e)
                 self._h_entries = []
+        if self.h_selected and not any(e["id"] == self.h_selected for e in self._h_entries):
+            self.h_selected = None
+        self._h_render_list()
         if self.h_selected:
             self._h_render_detail()
         else:
-            self._h_render_list()
-        self._h_paint_scope()
+            self._h_render_all()
+        if self._h_ph_on:
+            self._h_ph_on = False
+            self.h_entry.delete(0, "end")
+            self._h_placeholder(True)
         self._h_render_chat()
 
-    def _h_link(self, tag, command):
-        t = self.h_text
-        t.tag_bind(tag, "<Button-1>", lambda e: command())
-        t.tag_bind(tag, "<Enter>", lambda e, g=tag: (t.configure(cursor="hand2"),
-                                                     t.tag_add("hover", f"{g}.first", f"{g}.last")))
-        t.tag_bind(tag, "<Leave>", lambda e: (t.configure(cursor="arrow"),
-                                              t.tag_remove("hover", "1.0", "end")))
+    def _h_bind_row(self, widget, tag, command):
+        widget.tag_bind(tag, "<Button-1>", lambda e: command())
+        widget.tag_bind(tag, "<Enter>", lambda e, g=tag: (
+            widget.configure(cursor="hand2"), widget.tag_add("hover", f"{g}.first", f"{g}.last")))
+        widget.tag_bind(tag, "<Leave>", lambda e: (
+            widget.configure(cursor="arrow"), widget.tag_remove("hover", "1.0", "end")))
+
+    @staticmethod
+    def _group_of(e):
+        try:
+            d = datetime.date.fromisoformat(e["date"])
+        except Exception:
+            return "Earlier"
+        days = (datetime.date.today() - d).days
+        return ("Today" if days <= 0 else "Yesterday" if days == 1 else
+                "This week" if days < 7 else "This month" if days < 31 else "Earlier")
 
     def _h_render_list(self):
-        t = self.h_text
-        t.configure(state="normal")
-        t.delete("1.0", "end")
-        rows = self._h_filtered()
-        if not self._h_entries:
-            t.insert("end", "No saved meetings yet. Record a meeting and it appears here.", "faint")
-        elif not rows:
-            t.insert("end", "No meetings match.", "faint")
-        for i, e in enumerate(rows):
+        L = self.h_list
+        top = L.yview()[0]
+        L.configure(state="normal")
+        L.delete("1.0", "end")
+        L.insert("end", "All meetings\n", ("row_title", "all"))
+        L.insert("end", f"{len(self._h_entries)} meetings\n", ("row_meta", "all"))
+        self._h_bind_row(L, "all", lambda: self.history_open(None))
+        if self.h_selected is None:
+            L.tag_add("picked", "all.first", "all.last")
+        group = None
+        for i, e in enumerate(self._h_entries):
+            g = self._group_of(e)
+            if g != group:
+                L.insert("end", g.upper() + "\n", "group")
+                group = g
             tag = f"m{i}"
-            t.insert("end", f"{_day_label(e)}  {e['start']}\n", ("meta", tag))
-            t.insert("end", e["title"], ("title", tag))
-            n = _open_actions(e)
-            if n:
-                t.insert("end", f"   {n} open action item{'s' if n > 1 else ''}", ("badge", tag))
-            t.insert("end", "\n", (tag,))
-            if e["summary_line"]:
-                line = e["summary_line"]
-                t.insert("end", (line[:120] + "…" if len(line) > 120 else line) + "\n",
-                         ("muted", tag))
-            t.insert("end", "\n", (tag,))
-            self._h_link(tag, lambda m=e["id"]: self.history_open(m))
-        t.configure(state="disabled")
+            title = e["title"] if len(e["title"]) <= 30 else e["title"][:29] + "…"
+            L.insert("end", title + "\n", ("row_title", tag))
+            when = e["start"] if g in ("Today", "Yesterday") else f"{_day_label(e).rsplit(' ', 1)[0]}"
+            L.insert("end", when + "\n", ("row_meta", tag))
+            self._h_bind_row(L, tag, lambda m=e["id"]: self.history_open(m))
+            if e["id"] == self.h_selected:
+                L.tag_add("picked", f"{tag}.first", f"{tag}.last")
+        if not self._h_entries:
+            L.insert("end", "\nNo meetings yet.\nStart one with ＋", "row_meta")
+        L.configure(state="disabled")
+        L.yview_moveto(top)
 
     def history_open(self, meeting_id):
         self.h_selected = meeting_id
-        self.h_scope_all = False
         self.h_show_transcript = False
         self.history_render()
         self.h_text.yview_moveto(0)
 
-    def history_back(self):
-        self.h_selected = None
-        self.h_scope_all = True
-        self.history_render()
-
-    # -- History: one meeting ---------------------------------------------------------
-    def _h_render_detail(self):
+    def _h_clear(self):
+        for p in self._h_pills:
+            p.destroy()
+        self._h_pills = []
         t = self.h_text
-        e = next((x for x in self._h_entries if x["id"] == self.h_selected), None)
         t.configure(state="normal")
         t.delete("1.0", "end")
-        t.insert("end", "← All meetings\n", ("link", "back"))
-        self._h_link("back", self.history_back)
-        if e is None:
-            t.insert("end", "\nThis meeting is no longer in the folder.", "faint")
-            t.configure(state="disabled")
-            return
+
+    def _h_pill(self, text):
+        p = Pill(self.h_text, text, fg=MUTED, bg=SURFACE, parent_bg=BG, size=8)
+        self._h_pills.append(p)
+        self.h_text.window_create("end", window=p, padx=2)
+
+    def _h_action_row(self, a, meeting_id, source=None):
+        t = self.h_text
+        tag = f"act_{meeting_id}_{a['id']}"
+        done = a.get("status") == "done"
+        t.insert("end", "☑  " if done else "☐  ", ("check" if done else "box", "item", tag))
+        t.insert("end", a["text"], ("done", "item", tag) if done else ("item", tag))
+        meta = " · ".join(x for x in (a.get("owner") or "owner ?",
+                                           f"due {a['due']}" if a.get("due") else "",
+                                           source or "") if x)
+        if source:                                   # All meetings: details on their own line
+            t.insert("end", "\n")
+            t.insert("end", meta, ("meta", "meta_line", tag))
+        else:
+            t.insert("end", f"   {meta}", ("meta", tag))
+        if done and a.get("closed_by") == "claude":
+            t.insert("end", "   closed by Claude · ", "claude_badge")
+            t.insert("end", "undo", ("link", tag + "_undo"))
+            self._h_bind_row(t, tag + "_undo", lambda: self._h_set_action(meeting_id, a["id"], "open"))
+        t.insert("end", "\n", ("item",))
+        self._h_bind_row(t, tag, lambda: self._h_set_action(
+            meeting_id, a["id"], "open" if done else "done"))
+
+    ALL_RANGES = (("all", "All"), ("day", "Last day"), ("7", "Last 7 days"), ("30", "Last 30 days"))
+    ALL_ITEMS_SHOWN = 10
+
+    def _h_set_range(self, key):
+        self.h_range = key
+        self.h_all_expanded = False
+        self._h_render_all()
+
+    def _h_toggle_more(self):
+        self.h_all_expanded = not self.h_all_expanded
+        top = self.h_text.yview()[0]
+        self._h_render_all()
+        self.h_text.yview_moveto(top)
+
+    def _h_filter_row(self):
+        """All · Last day · Last 7 days · Last 30 days (embedded under the title)."""
+        row = tk.Frame(self.h_text, bg=BG)
+        for key, label in self.ALL_RANGES:
+            on = key == self.h_range
+            p = Pill(row, label, fg=FG if on else MUTED, bg=SURFACE_HI if on else BG,
+                     parent_bg=BG, size=9, height=26, command=lambda k=key: self._h_set_range(k))
+            p.pack(side="left", padx=(0, px(4)))
+        self._h_pills.append(row)
+        self.h_text.window_create("end", window=row)
+
+    def _h_render_all(self):
+        """All meetings: open action items on top, done ones struck below them
+        (first ten, then 'Show more'), then recent decisions. Filter by date."""
+        self._h_clear()
+        t = self.h_text
+        today = datetime.date.today()
+        days = {"day": 1, "7": 7, "30": 30}.get(self.h_range)
+        since = (today - datetime.timedelta(days=days)).isoformat() if days else ""
+        entries = [e for e in self._h_entries if not since or e["date"] >= since]
+        t.insert("end", "All meetings\n", "big")
+        self._h_filter_row()
+        t.insert("end", "\n")
+        open_items = [(a, e) for e in entries for a in e["action_items"]
+                      if a.get("status") != "done"]
+        done_items = [(a, e) for e in entries for a in e["action_items"]
+                      if a.get("status") == "done"]
+        done_items.sort(key=lambda x: x[0].get("closed_at") or "", reverse=True)
+        t.insert("end", "Action items\n", "section")
+        meta = f"{len(open_items)} open · {len(done_items)} done · {len(entries)} meetings"
+        t.insert("end", meta + "\n", ("meta", "meta_line0"))
+        items = open_items + done_items
+        if not items:
+            t.insert("end", "No action items in this period.\n", "faint")
+        shown = items if self.h_all_expanded else items[:self.ALL_ITEMS_SHOWN]
+        for a, e in shown:
+            self._h_action_row(a, e["id"], source=f"{e['title']}, {fmt_day_iso(e['date'])}")
+        if len(items) > self.ALL_ITEMS_SHOWN:
+            label = ("Show less" if self.h_all_expanded
+                     else f"Show {len(items) - self.ALL_ITEMS_SHOWN} more")
+            t.insert("end", label + "\n", ("link", "more", "item"))
+            self._h_bind_row(t, "more", self._h_toggle_more)
+        decisions = [(x, e) for e in entries for x in e["decisions"]][:10]
+        if decisions:
+            t.insert("end", "Recent decisions\n", "section")
+            last = None
+            for i, (x, e) in enumerate(decisions):
+                if e["id"] != last:                  # the meeting first (click to open it)
+                    tag = f"dsrc{i}"
+                    t.insert("end", e["title"], ("dec_meeting", tag))
+                    t.insert("end", f"   {fmt_day_iso(e['date'])}\n", ("meta", "dec_date"))
+                    self._h_bind_row(t, tag, lambda m=e["id"]: self.history_open(m))
+                    last = e["id"]
+                t.insert("end", "•  " + x["text"] + "\n", ("bullet", "dec_item"))
+        t.configure(state="disabled")
+
+    def _h_render_detail(self):
+        e = next((x for x in self._h_entries if x["id"] == self.h_selected), None)
+        self._h_clear()
+        t = self.h_text
         try:
             d = load_meeting(e["path"])
         except Exception as ex:
-            t.insert("end", f"\nCould not read this meeting: {ex}", "faint")
+            t.insert("end", f"Could not read this meeting: {ex}", "faint")
             t.configure(state="disabled")
             return
         t.insert("end", (d["title"] or "Untitled meeting") + "\n", "big")
-        meta = f"{_day_label(e)}, {d['start']}–{d['end']}"
+        when = fmt_day_iso(d["date"]) + (f" · {d['start']}" if d["start"] else "")
+        self._h_pill(when)
         if d["duration_min"]:
-            meta += f" ({d['duration_min']} min)"
-        t.insert("end", meta + "\n", "meta")
+            self._h_pill(f"{d['duration_min']} min")
         if d["participants"]:
-            t.insert("end", "With " + ", ".join(d["participants"]) + "\n", "muted")
-        if d["imported"]:
-            t.insert("end", "Imported from an older Sidenote file: some parts may be missing.\n",
-                     "meta")
-
-        def section(name):
-            t.insert("end", name + "\n", "section")
+            n = len(d["participants"])
+            self._h_pill(f"{n} {'person' if n == 1 else 'people'}")
+        t.insert("end", "\n")
+        if d["participants"]:
+            t.insert("end", ", ".join(d["participants"]) + "\n", "meta")
         if d["summary"]:
-            section("Summary")
+            t.insert("end", "Summary\n", "section")
             t.insert("end", d["summary"] + "\n")
-        if d["decisions"]:
-            section("Decisions")
-            for x in d["decisions"]:
-                t.insert("end", "• " + x["text"] + "\n")
-        if d["open_questions"]:
-            section("Open questions")
-            for x in d["open_questions"]:
-                answered = x.get("status") == "answered"
-                t.insert("end", "• " + x["text"] + "\n", "done" if answered else ())
-        section("Action items")
+        t.insert("end", "Action items\n", "section")
         if not d["action_items"]:
             t.insert("end", "None\n", "faint")
         for a in d["action_items"]:
-            tag = f"act_{a['id']}"
-            done = a.get("status") == "done"
-            t.insert("end", "☑  " if done else "☐  ",
-                     ("check" if done else "box", tag))
-            t.insert("end", a["text"], ("done", tag) if done else (tag,))
-            meta = ", ".join(x for x in (a.get("owner") or "owner ?",
-                                          f"due {a['due']}" if a.get("due") else "") if x)
-            t.insert("end", f"   {meta}", ("meta", tag))
-            if done and a.get("closed_by") == "claude":
-                t.insert("end", "   closed by Claude", "claude_badge")
-                t.insert("end", " · ", "meta")
-                t.insert("end", "undo", ("link", tag + "_undo"))
-                self._h_link(tag + "_undo", lambda m=d["id"], i=a["id"]: self._h_set_action(m, i, "open"))
-            t.insert("end", "\n")
-            self._h_link(tag, lambda m=d["id"], i=a["id"], s=done:
-                         self._h_set_action(m, i, "open" if s else "done"))
-        if d["questions_to_ask"]:
-            section("Questions you saved to ask")
-            for q in d["questions_to_ask"]:
-                t.insert("end", ("☑  " if q.get("asked") else "☐  ") + q["text"] + "\n",
-                         "done" if q.get("asked") else ())
+            self._h_action_row(a, d["id"])
+        if d["decisions"]:
+            t.insert("end", "Decisions\n", "section")
+            for x in d["decisions"]:
+                t.insert("end", "•  " + x["text"] + "\n", "bullet")
+        if d["open_questions"]:
+            t.insert("end", "Open questions\n", "section")
+            for x in d["open_questions"]:
+                t.insert("end", "•  " + x["text"] + "\n",
+                         ("bullet", "done") if x.get("status") == "answered" else "bullet")
         n = len(d["transcript"])
         if n:
-            t.insert("end", "\n")
-            label = ("▾ Hide transcript" if self.h_show_transcript
-                     else f"▸ Show transcript ({n} lines)")
+            t.insert("end", "Transcript\n", "section")
+            label = "Hide" if self.h_show_transcript else f"Show {n} lines"
             t.insert("end", label + "\n", ("link", "tr"))
-            self._h_link("tr", self._h_toggle_transcript)
+            self._h_bind_row(t, "tr", self._h_toggle_transcript)
             if self.h_show_transcript:
                 for r in d["transcript"]:
                     t.insert("end", f"{r['t'][:5]}  ", "meta")
                     if r["speaker"]:
-                        t.insert("end", r["speaker"] + ": ", "muted")
+                        t.insert("end", r["speaker"] + "  ", "muted")
                     t.insert("end", r["text"] + "\n")
+        if d["imported"]:
+            t.insert("end", "\nSaved by an older Sidenote: some parts may be missing.\n", "meta")
         t.configure(state="disabled")
 
     def _h_toggle_transcript(self):
@@ -6354,7 +6846,7 @@ class Overlay:
         self.h_text.yview_moveto(top)
 
     def _h_set_action(self, meeting_id, item_id, status):
-        """Checkbox in History: writes straight to the meeting file (no Claude)."""
+        """Checkbox: writes straight to the meeting file (no Claude needed)."""
         result = core_update_item(meeting_id, "action", item_id, status, by="user")
         if not result.startswith("Updated"):
             self.toast(result[:80])
@@ -6362,79 +6854,66 @@ class Overlay:
         self.history_render(reload=True)
         self.h_text.yview_moveto(top)
 
-    # -- History: chat with Claude -----------------------------------------------------
-    def _h_paint_scope(self):
-        if self.h_selected and not self.h_scope_all:
-            e = next((x for x in self._h_entries if x["id"] == self.h_selected), None)
-            name = e["title"] if e else "this meeting"
-            self.h_scope_lab.configure(text=f"this meeting ({name[:28]})  ⇄")
-        else:
-            self.h_scope_lab.configure(text="all meetings" + ("  ⇄" if self.h_selected else ""))
-
-    def _h_toggle_scope(self):
-        if self.h_selected:
-            self.h_scope_all = not self.h_scope_all
-            self._h_paint_scope()
-
+    # -- asking Claude about past meetings ------------------------------------------------
     def history_ask(self):
-        text = self.h_entry.get().strip()
+        if self._h_offline:
+            return
+        text = "" if self._h_ph_on else self.h_entry.get().strip()
         if not text:
             return
-        if not self.claude_connected():
-            self._h_chat.append(("note", "Claude isn't connected, so it can't answer yet. Copy "
-                                         "“open Sidenote” above into a Claude chat, "
-                                         "then ask again."))
-            self._h_render_chat()
-            return
         self.h_entry.delete(0, "end")
-        scope = None if (self.h_scope_all or not self.h_selected) else self.h_selected
-        question_queue.put({"text": text, "scope": "history", "meeting_id": scope})
+        question_queue.put({"text": text, "scope": "history", "meeting_id": self.h_selected})
         live.last_activity = time.time()
         self._h_chat.append(("you", text))
         self._h_waiting = True
         self._h_render_chat()
 
+    def _h_clear_chat(self):
+        self._h_chat = []
+        self._h_waiting = False
+        self._h_render_chat()
+
     def _h_render_chat(self):
+        """The conversation reads top-down: your question, then Claude's answer."""
+        items = list(self._h_chat[-20:])
+        if self._h_waiting:
+            items.append(("hint", "Claude is thinking…"))
+        if not items:
+            if self._h_chat_shown:
+                self.h_paned.forget(self.h_chat)
+                self._h_chat_shown = False
+            return
+        if not self._h_chat_shown:
+            self.h_main.update_idletasks()
+            height = max(px(160), int(self.h_paned.winfo_height() * 0.42))
+            self.h_paned.add(self.h_chat, stretch="never", minsize=px(100), height=height)
+            self._h_chat_shown = True
         t = self.h_chat_text
         t.configure(state="normal")
         t.delete("1.0", "end")
-        if not self._h_chat:
-            t.insert("end", "Ask about one meeting or all of them, e.g. “What are my open "
-                            "action items from the last two weeks?”", "hint")
-        items = list(self._h_chat)
-        if self._h_waiting:
-            items.append(("hint", "Claude is thinking…"))
-        for who, text in reversed(items):            # newest on top
+        for who, text in items:
             if who == "you":
+                t.insert("end", "You\n", "you_name")
                 t.insert("end", text + "\n", "you")
             elif who == "claude":
-                t.insert("end", "Claude  ", "claude_name")
-                t.insert("end", text + "\n\n")
+                t.insert("end", "Claude\n", "claude_name")
+                t.insert("end", text + "\n", "claude")
             else:
                 t.insert("end", text + "\n", "note" if who == "note" else "hint")
         t.configure(state="disabled")
-        t.yview_moveto(0)
+        t.see("end")                                 # newest at the bottom
 
     def _offline_tick(self):
-        """Show the 'not connected' line on Home and History when Claude isn't there."""
+        """Claude not connected: one quiet line on the start screen; in Past meetings
+        the ask box says so and its send button is greyed out."""
         offline = not self.claude_connected()
-        for row, attr in ((self.home_offline, "_home_offline_shown"),
-                          (self.h_offline, "_h_offline_shown")):
-            if offline != getattr(self, attr):
-                if offline:
-                    if row is self.h_offline:
-                        row.pack(fill="x", pady=(4, 0), before=self.h_chat_text)
-                    else:
-                        row.pack(fill="x", pady=(4, 0))
-                else:
-                    row.pack_forget()
-                setattr(self, attr, offline)
-
-    def go_history(self, _e=None):
-        if live.mode == "record" and not transcript.ended_at and transcript.count_lines():
-            self.toast("End the meeting first (End meeting, top right)")
-            return
-        self.show_screen("history")
+        if offline != self._start_offline_shown:
+            if offline:
+                self.start_offline.pack(fill="x", pady=(px(16), 0))
+            else:
+                self.start_offline.pack_forget()
+            self._start_offline_shown = offline
+        self._h_set_offline(offline)
 
     def toggle_captions(self):
         captions_win.hide_wanted = not captions_win.hide_wanted
@@ -6514,7 +6993,7 @@ class Overlay:
                     self._h_waiting = False
                     self._h_chat.append(("claude", payload))
                     self._h_render_chat()
-                if kind == "history_changed" and self.screen == "history":
+                if kind == "history_changed" and self.screen == "meetings":
                     top = self.h_text.yview()[0]
                     self.history_render(reload=True)
                     self.h_text.yview_moveto(top)
@@ -6549,10 +7028,6 @@ class Overlay:
         if time.time() < self.toast_until:
             self.state_dot.configure(fg=ACCENT)
             self.state_label.configure(text=self.toast_text, fg=FG)
-        elif transcript.ended_at:
-            self.state_dot.configure(fg=FAINT)
-            self.state_label.configure(text="Meeting ended \u00b7 new meeting is in the \u22ef menu",
-                                       fg=MUTED)
         else:
             text, color = self._state()
             self.state_dot.configure(fg=color)
@@ -6560,10 +7035,16 @@ class Overlay:
 
         ctext, ccolor = self._captions_state()
         _, minutes = transcript.stats()
-        self.caption_dot.configure(fg=ccolor)
-        self.right_label.configure(text=f"{ctext}  ·  {minutes} min",
-                                   fg=WARN if ccolor == WARN else FAINT,
-                                   cursor="hand2" if self._mic_fixable() else "")
+        recording = live.mode == "record" and not transcript.ended_at
+        if live.mode == "record":
+            self.p_time.set(f"\u25cf  {minutes} min" if recording else f"Ended \u00b7 {minutes} min",
+                            ACCENT_HI if recording else FAINT)
+            n = len(transcript.people())
+            self.p_people.set(f"{n} {'person' if n == 1 else 'people'}" if n else "")
+            self.p_source.set(ctext if recording else "", WARN if ccolor == WARN else MUTED,
+                              clickable=self._mic_fixable())
+        self.tab_live.set(badge=recording)
+        self._sync_top_btn()
 
         if transcript.ended_at or "transcript" in self.visible:
             self.tail.configure(text="")
@@ -6587,10 +7068,15 @@ class Overlay:
     PANEL_ORDER = ("agenda", "context", "questions", "actions", "transcript")
 
     def toggle_panel(self, key):
+        """The views work as tabs: one open at a time (click it again to close),
+        so the open list has room and Claude's answers stay readable."""
         if key in self.visible:
             self.paned.forget(self.panels[key])
             self.visible.remove(key)
         else:
+            for other in list(self.visible):
+                self.paned.forget(self.panels[other])
+                self.visible.remove(other)
             self.visible.append(key)
             self.visible.sort(key=self.PANEL_ORDER.index)
             # insert before the next visible panel, or before the answer
@@ -6618,6 +7104,15 @@ class Overlay:
             n = len(transcript.context[key])
         return max(70, min(40 + max(1, n) * 24, share))
 
+    def _chip_hover(self, key, on):
+        chip = self.chips[key]
+        if key in self.visible:
+            return
+        bg = SURFACE if on else BG
+        for part in ("frame", "border", "box", "name"):
+            chip[part].configure(bg=bg)
+        chip["name"].configure(fg=FG if on else MUTED)
+
     def update_chips(self):
         with transcript.lock:
             n_actions = sum(1 for a in transcript.context["actions"] if not a["done"])
@@ -6631,13 +7126,11 @@ class Overlay:
         for key, chip in self.chips.items():
             on = key in self.visible
             flashing = flash_until.get(key, 0) > time.time()
-            bg = "#3a2a24" if on else BG                       # warm tint when on
+            bg = SURFACE_HI if on else BG                      # open views are highlighted
             fg = FG if on else MUTED
-            chip["frame"].configure(bg=bg)
-            chip["border"].configure(bg=ACCENT if on else LINE)
-            chip["box"].configure(text="\u2611" if on else "\u2610", bg=bg,
-                                  fg=ACCENT if on else MUTED)
-            chip["name"].configure(bg=bg, fg=fg)
+            for part in ("frame", "border", "box", "name"):
+                chip[part].configure(bg=bg)
+            chip["name"].configure(fg=fg)
             n = counts[key]
             badge = chip["badge"]
             if n:
@@ -6886,8 +7379,13 @@ def main():
     else:
         log.info("Test mode: overlay only. Close the window or press Ctrl+C to stop.")
     # Only one copy can show the overlay. Others forward calls to it, and
-    # take over if the primary copy goes away.
-    while not try_become_primary():
+    # take over if the primary copy goes away (or has older code).
+    reopen = False
+    if not try_become_primary():
+        took_over, reopen = take_over_from_older()
+        if took_over:
+            log.info("Took over from an older Sidenote")
+    while not role["primary"] and not try_become_primary():
         if test_mode:
             log.info("Sidenote is already running in another copy.")
             return
@@ -6901,7 +7399,7 @@ def main():
     atexit.register(transcript.save_now)
     set_app_id()
 
-    if test_mode:
+    if test_mode or reopen:
         open_request.set()
     # The window stays hidden until someone asks to open it.
     while True:

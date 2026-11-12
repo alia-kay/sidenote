@@ -76,15 +76,17 @@ How it works: Sidenote is a local MCP server for the Claude desktop app, on Wind
 
 ## Saved files
 
-- Each meeting is saved automatically in Documents/Sidenote as a readable text file and, next to it, a <same name>.meeting.json (schema_version 1): meeting info, summary, by person, decisions, open questions, action items (id, owner, real due date, status, where they came from, who closed them and why), questions to ask, context and the transcript with timestamps. One self-contained file per meeting; a small cache (.sidenote_index.json) keeps History fast and is rebuilt automatically.
+- Each meeting is saved automatically in Documents/Sidenote as a readable text file and, next to it, a <same name>.meeting.json (schema_version 1): meeting info, summary, by person, decisions, open questions, action items (id, owner, real due date, status, where they came from, who closed them and why), questions to ask, context and the transcript with timestamps. One self-contained file per meeting; a small cache (.sidenote_index.json) keeps Past meetings fast and is rebuilt automatically.
 - Meetings saved before v10 are imported once (best effort, marked imported); their .txt files are never changed. Installing or updating Sidenote never writes to or deletes anything in Documents/Sidenote.
 
-## Home and History
+## Window: two tabs
 
-- "open Sidenote" opens the window on Home: Record a meeting, or History. Captions are read only while recording.
-- History: meetings by date with search and filters, a detail view (summary, decisions, open questions, action items with checkboxes, transcript folded), and a chat to ask Claude about one meeting or all of them. Works without Claude for browsing and ticking; says so plainly (with a copyable "open Sidenote") when Claude isn't connected.
+- Two icon tabs are always at the top: + (New meeting) and a clock (Past meetings). "open Sidenote" opens on +, where the user clicks Start meeting; captions are read only while recording, and recording goes on while the user looks at past meetings (+ shows a dot).
+- Past meetings: a list by day on the left (All meetings on top) and the selected meeting in the center: summary, action items with checkboxes, decisions, open questions, transcript folded. "All meetings" shows every open action item and recent decisions. A rounded ask box asks Claude about the selected meeting or all meetings. The window widens for the list and narrows back on +.
+- Browsing and ticking work without Claude; when Claude isn't connected the window says so plainly with a one-click copy of "open Sidenote".
 - Claude answers past-meeting questions with list_meetings, find_items, get_meeting and search_transcripts, always naming the source meeting and date. It closes action items only on the user's explicit request (stored as closed by Claude, with the request as evidence, undoable).
-- On Home/History Claude listens in longer intervals and stops (IDLE) after 15 quiet minutes.
+- When nothing is recording, Claude listens in longer intervals and stops (IDLE) after 15 quiet minutes.
+- Dark look with a serif title, rounded pills (time, people, captions source) and a rounded ask box with a round send button.
 
 ## Tools Claude can use (MCP)
 
