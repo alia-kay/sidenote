@@ -35,6 +35,7 @@
     {"name": "add_context_item", "description": "Add a Jira ticket or Confluence page related to the meeting."},
     {"name": "save_recap", "description": "Save the meeting recap into the meeting file."},
     {"name": "debug_meet_tree", "description": "Troubleshooting: save the structure of the Google Meet window."},
+    {"name": "debug_call_window", "description": "Troubleshooting: save the structure of the Teams or Zoom (browser) window, to read their captions."},
     {"name": "debug_live_captions_tree", "description": "Troubleshooting: save the structure of the Live Captions window."},
     {"name": "get_meeting_context", "description": "Return the meeting title, agenda, participants, role and goals."},
     {"name": "get_recent_transcript", "description": "Return the transcript from the last few minutes."},

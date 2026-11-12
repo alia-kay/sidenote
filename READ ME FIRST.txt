@@ -37,7 +37,12 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
      (the CC button) and reads them, including your own voice. If captions
      don't come on within a few seconds, press CC yourself. If you turn
      captions off during the call, Sidenote leaves them off.
-   - Other apps (Zoom, Teams, videos): Sidenote turns on macOS Live Captions by
+   - Zoom in the browser (Chrome, Edge, Safari): Sidenote turns on Zoom's
+     captions by itself (More > Show Captions) and reads them. Keep the Zoom
+     tab in front; Sidenote tells you if it's in a background tab.
+   - Microsoft Teams (the app or in the browser): Sidenote turns on Teams' live
+     captions by itself (More > Language and speech) and reads them with names.
+   - Other apps (Zoom app, videos, ...): Sidenote turns on macOS Live Captions by
      itself and hides its window. Live Captions hears the other people; your
      own voice comes from your microphone, transcribed on your Mac.
      The first time, macOS asks "Claude would like to access the microphone":

@@ -207,18 +207,30 @@ class Profile:
 
 # The user's own display name in Google Meet, when a label shows it
 # ("Iman Kay (You)" in the people list, "Google Account: Iman Kay (...)").
-MEET_SELF_LABELS = (re.compile(r"^(.{2,40}?)\s*\((?:You|you)\)$"),
+MEET_SELF_LABELS = (re.compile(r"^(?:My video|\u041c\u043e\u0435 \u0432\u0438\u0434\u0435\u043e|Mon flux vid\u00e9o|"
+                               r"Mi v\u00eddeo|Mi video|Mein Video|Il mio video|Meu v\u00eddeo),\s*([^,]{2,60}?)\s*,"),
+                    re.compile(r"^(.{2,40}?)\s*\((?:Host, |Co-host, )?(?:You|you|me|Me)\)$"),
                     re.compile(r"^Google Account:\s*([^(\n]{2,40}?)\s*(?:\(|$)"))
 
 
+SELF_ALIASES = set()   # the user's name as the meeting app shows it ('Alia Kayeshka')
+
+
 def note_meet_label(label):
-    """Called for each element while a Meet reader walks the window (best effort)."""
-    if not label or profile.data["name_source"] in ("typed", "meet") or len(label) > 120:
+    """Called for each element while a reader walks a meeting window (best
+    effort). The user's display name there becomes an alias for the user, so
+    their caption lines count as theirs even if Sidenote calls them 'Alia'."""
+    if not label or len(label) > 200:
         return
     for pattern in MEET_SELF_LABELS:
         m = pattern.match(label)
         if m and "@" not in m.group(1):
-            set_user_name(m.group(1), "meet")
+            name = " ".join(m.group(1).split())
+            if name not in SELF_ALIASES:
+                SELF_ALIASES.add(name)
+                log.info("User's name in the meeting app noted")
+            if profile.data["name_source"] not in ("typed", "meet"):
+                set_user_name(name, "meet")
             return
 
 
@@ -291,17 +303,39 @@ def owner_text(owner):
     return owner
 
 
+def _same_person(a, b):
+    """'Aliaksandra Kayeshka' and 'Alia Kayeshka': same surname, and one first
+    name starts with the other (at least 4 letters). Apps show the same person
+    with a full or a short first name."""
+    wa, wb = a.lower().split(), b.lower().split()
+    if a.lower() == b.lower():
+        return True
+    if len(wa) < 2 or len(wb) < 2 or wa[-1] != wb[-1]:
+        return False
+    fa, fb = wa[0], wb[0]
+    short, long_ = sorted((fa, fb), key=len)
+    return len(short) >= 4 and long_.startswith(short)
+
+
 def speaker_name(label):
-    """Transcript speaker label with the user's own 'You' replaced by their name."""
-    if label in ("You", "you", "Me") and profile.name:
+    """Transcript speaker label with the user's own 'You' (or their display name
+    in the meeting app) replaced by the name Sidenote uses for them."""
+    if not profile.name or not label:
+        return label
+    if label in ("You", "you", "Me") or label in SELF_ALIASES:
+        return profile.name
+    if " " in label and any(_same_person(label, n) for n in SELF_ALIASES | {profile.name}):
         return profile.name
     return label
 
 
 def display_line(line):
-    """A transcript line with 'You: ...' shown as '<name>: ...'."""
-    if profile.name and line.startswith(("You: ", "Me: ")):
-        return profile.name + line[line.index(":"):]
+    """A transcript line with 'You: ...' (or the user's display name in the
+    meeting app) shown as '<name>: ...'."""
+    if profile.name:
+        speaker, sep, rest = line.partition(": ")
+        if sep and speaker_name(speaker) != speaker:
+            return f"{profile.name}: {rest}"
     return line
 
 
@@ -626,17 +660,18 @@ class Transcript:
                 self.entries.append((self.ended_at, "MEETING ENDED"))
         self.save_now()
 
-    def ingest(self, raw_text, speaker=""):
+    def ingest(self, raw_text, speaker="", final=False):
         """Take the current caption block and commit any newly finished sentences.
         speaker: label added in front of each line (e.g. 'Others' on Mac when your
-        own microphone is transcribed separately)."""
+        own microphone is transcribed separately). final=True: the block is done
+        (e.g. Zoom replaced its caption line), so its last sentence is finished too."""
         if self.ended_at:
             return                        # meeting ended: stop recording
         text = " ".join(raw_text.split())
         if not text:
             return
         parts = SENTENCE_SPLIT.split(text)
-        finals, pending = parts[:-1], parts[-1]
+        finals, pending = (parts, "") if final else (parts[:-1], parts[-1])
 
         with self.lock:
             if self.skip_visible:          # captions from before this meeting started
@@ -1031,7 +1066,7 @@ class Transcript:
             f"Questions to ask (saved for the user):\n{questions or '(none)'}\n"
             f"Context already found (Jira/Confluence):\n{ctx or '(none)'}\n"
             f"Transcript source: {self.source or '(none yet)'}"
-            f"{' - speaker names included' if self.source == 'Google Meet' else ''}\n"
+            f"{' - speaker names included' if self.source in ('Google Meet', 'Microsoft Teams') else ' - names only when Zoom shows them' if self.source == 'Zoom' else ''}\n"
             f"Meeting running for {minutes} min, {count} lines captured."
         )
 
@@ -1395,6 +1430,17 @@ def _activate(control):
     return False
 
 
+def _lc_wait(win, pred, seconds=3.0):
+    """Look for a Live Captions element for up to a few seconds (menus open slowly,
+    especially right after Live Captions starts)."""
+    end = time.time() + seconds
+    while True:
+        found = _lc_find(win, pred)
+        if found is not None or time.time() >= end:
+            return found
+        time.sleep(0.3)
+
+
 def enable_lc_microphone():
     """Turn on 'Include microphone audio' in Live Captions (it resets on every start).
     Returns 'on', 'already', or an error text."""
@@ -1414,14 +1460,12 @@ def enable_lc_microphone():
             return "could not find the Live Captions settings button"
         _activate(settings)
         opened = True
-        time.sleep(0.8)
-        prefs = _lc_find(win, lambda c: c.ControlTypeName == "MenuItemControl"
+        prefs = _lc_wait(win, lambda c: c.ControlTypeName == "MenuItemControl"
                          and name(c).startswith("preferences"))
         if prefs is None:
             return "could not find Preferences in the Live Captions menu"
         _activate(prefs)
-        time.sleep(0.8)
-        mic = _lc_find(win, mic_pred)
+        mic = _lc_wait(win, mic_pred)
         if mic is None:
             return "could not find 'Include microphone audio'"
     try:
@@ -1459,6 +1503,9 @@ class LiveCaptionsReader:
         self.mic_done_for = None          # Live Captions window we already set up
         self.status = "Live Captions not found - press Win+Ctrl+L"
 
+    MIC_TRIES = 3
+    MIC_RETRY_SECONDS = 10
+
     def ensure_microphone(self, win):
         try:
             handle = win.NativeWindowHandle
@@ -1466,9 +1513,14 @@ class LiveCaptionsReader:
             return
         if self.mic_done_for == handle:
             return
-        self.mic_done_for = handle
+        tries, last = getattr(self, "mic_tries", {}).get(handle, (0, 0.0))
+        if tries >= self.MIC_TRIES or time.time() - last < self.MIC_RETRY_SECONDS:
+            return
         result = enable_lc_microphone()
-        log.info("Live Captions microphone: %s", result)
+        self.mic_tries = {handle: (tries + 1, time.time())}
+        log.info("Live Captions microphone: %s (try %d)", result, tries + 1)
+        if result in ("on", "already"):
+            self.mic_done_for = handle
         if result == "on":
             ui_queue.put(("toast", "Turned on your microphone in Live Captions"))
         elif result != "already":
@@ -1492,7 +1544,10 @@ class LiveCaptionsReader:
                     self.status = "Live Captions open - waiting for speech"
                     return True
                 self.text_box = candidate
+                self.lc_window = win
                 log.info("Connected to Live Captions")
+            if getattr(self, "lc_window", None) is not None:
+                self.ensure_microphone(self.lc_window)     # retries a failed first try
             raw = self.text_box.Name or ""
             self.status = "Live Captions connected"
             if raw != self.last_raw:
@@ -1546,7 +1601,8 @@ class AutoCaptions:
     MAX_TRIES = 2
     RETRY_SECONDS = 6
 
-    def __init__(self):
+    def __init__(self, app="Google Meet", short="Meet"):
+        self.app, self.short = app, short
         self.clear()
 
     def clear(self):
@@ -1557,7 +1613,7 @@ class AutoCaptions:
     def captions_on(self, key):
         if key not in self.seen_on:
             self.seen_on.add(key)
-            auto_cc_status["text"] = "Meet captions on"
+            auto_cc_status["text"] = f"{self.short} captions on"
 
     def attempt(self, key):
         """Number of this try (0 = first), or None if no press is wanted now."""
@@ -1570,11 +1626,11 @@ class AutoCaptions:
 
     def pressed(self, key, attempt, how, ok):
         self.tries[key] = (attempt + 1, time.time())
-        auto_cc_status["text"] = (f"Meet CC pressed via {how}, try {attempt + 1}"
+        auto_cc_status["text"] = (f"{self.short} CC pressed via {how}, try {attempt + 1}"
                                   + ("" if ok else " (press failed)"))
         log.info("Auto captions: %s", auto_cc_status["text"])
         if ok and attempt == 0:
-            ui_queue.put(("toast", "Turning on Google Meet captions"))
+            ui_queue.put(("toast", f"Turning on {self.app} captions"))
 
 
 class MeetReader:
@@ -1992,6 +2048,763 @@ class MacMeetReader:
             return False
 
 
+# ---------------------------------------------------------------------------
+# Zoom in the browser (Zoom's web client, app.zoom.us), Windows and Mac
+# ---------------------------------------------------------------------------
+# Captions are one rolling line in the page; Sidenote turns them on with
+# "Show Captions" (on the bar, or under More) once per meeting.
+ZOOM_CAPTION_BOX = "live-transcription-subtitle__box"
+ZOOM_SHOW_CAPTIONS = "Show Captions"
+ZOOM_MORE = "More meeting control"
+ZOOM_IGNORE = {"captions are on", "captions are off"}
+ZOOM_BROWSERS_WIN = ("chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe")
+NAMED_SOURCES = ("Google Meet", "Zoom", "Microsoft Teams")   # sources with speaker names
+SPEAKER_LINE = re.compile(r"^([A-Z][\w.'\- ]{1,30}):\s+(\S.*)$")
+
+
+def _continues(old, new):
+    """True if the new caption text goes on from the old one: Zoom grows the line
+    while someone speaks, and trims its start when it gets long."""
+    o, n = norm(old), norm(new)
+    if not o or not n:
+        return False
+    return n.startswith(o[:20]) or o[-25:] in n
+
+
+class CaptionStream:
+    """A caption line that grows while someone speaks and is replaced when the
+    next line starts. Finished sentences are saved as they come; the rest of a
+    line when it is replaced or lost."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.text, self.speaker = "", ""
+
+    @staticmethod
+    def split(texts):
+        """(speaker, text). Zoom may show a name as its own item, or 'Name: text'."""
+        texts = [t for t in texts if t.strip().lower() not in ZOOM_IGNORE]
+        if not texts:
+            return "", ""
+        if len(texts) >= 2 and len(texts[0]) <= 40 and len(texts[0].split()) <= 4 \
+                and not re.search(r"[.!?,:]", texts[0]) and texts[0][:1].isupper():
+            return texts[0], " ".join(texts[1:])
+        m = SPEAKER_LINE.match(" ".join(texts))
+        if m and len(m.group(1).split()) <= 4:
+            return m.group(1).strip(), m.group(2)
+        return "", " ".join(texts)
+
+    @staticmethod
+    def merge(old, new):
+        """The whole line so far. When Zoom trims the start of a long line, put
+        the trimmed part back: new = (end of old) + more words."""
+        if not old or norm(new).startswith(norm(old)[:20]):
+            return new
+        ow, nw = old.split(), new.split()
+        key = lambda w: norm(w)
+        for skip in (0, 1):                  # the first new word may be cut ('e migration')
+            rest = nw[skip:]
+            for i in range(max(0, len(ow) - len(rest)), len(ow) - 2):
+                tail = ow[i:]
+                if [key(w) for w in tail] == [key(w) for w in rest[:len(tail)]]:
+                    return " ".join(ow + rest[len(tail):])
+        return new
+
+    def feed(self, texts):
+        speaker, text = self.split(texts)
+        if not text:
+            return
+        if self.text and (speaker != self.speaker or not _continues(self.text, text)):
+            self.flush()                     # a new line started: the old one is done
+        text = self.merge(self.text, text) if self.text else text
+        self.text, self.speaker = text, speaker
+        transcript.ingest(text, speaker=speaker)
+
+    def flush(self):
+        if self.text:
+            transcript.ingest(self.text, speaker=self.speaker, final=True)
+        self.reset()
+
+
+class ZoomWebReader:
+    """Zoom meetings in the browser on Windows (Chrome, Edge, ...)."""
+    name = "Zoom"
+    MISSING_SECONDS = 8          # caption box gone this long = captions off / lost
+
+    def __init__(self):
+        self.window = self.box = None
+        self.last_search = self.box_seen = 0.0
+        self.status = "Zoom not found"
+        self.auto = AutoCaptions("Zoom", "Zoom")
+        self.stream = CaptionStream()
+
+    def reset(self):
+        self.window = self.box = None
+        self.stream.reset()
+
+    HINT_EVERY = 120             # background-tab reminder at most every 2 minutes
+
+    def _hint_background_tab(self, now):
+        """Browsers only expose the tab on screen. If a Zoom meeting is open in
+        a background tab, say so (a toast: it doesn't take focus)."""
+        if now - getattr(self, "hint_at", 0) < self.HINT_EVERY:
+            return
+        for win in auto.GetRootControl().GetChildren():
+            try:
+                if win.ClassName not in BROWSER_CLASSES or \
+                        _win_process_name(win.ProcessId) not in ZOOM_BROWSERS_WIN:
+                    continue
+                for c, _ in _walk(win, 12):
+                    if c.ControlTypeName == "TabItemControl" and \
+                            (c.Name or "").lower().startswith("zoom meeting"):
+                        self.hint_at = now
+                        ui_queue.put(("toast", "Zoom is in a background tab: bring it to "
+                                               "the front so Sidenote can read its captions"))
+                        return
+            except Exception:
+                continue
+
+    def _find_window(self):
+        for win in auto.GetRootControl().GetChildren():
+            try:
+                if win.ClassName in BROWSER_CLASSES and "zoom" in (win.Name or "").lower() \
+                        and _win_process_name(win.ProcessId) in ZOOM_BROWSERS_WIN:
+                    return win
+            except Exception:
+                continue
+        return None
+
+    def _scan(self, root, want=None):
+        """Caption box and the buttons Sidenote may press, in one walk."""
+        found = {"box": None, "show": None, "more": None, "hide": None}
+        for c, _ in _walk(root, 80):
+            try:
+                kind, name = c.ControlTypeName, (c.Name or "")
+                if ZOOM_CAPTION_BOX in (c.ClassName or ""):
+                    found["box"] = c
+                elif kind == "ButtonControl":
+                    if name == ZOOM_SHOW_CAPTIONS:
+                        found["show"] = c
+                    elif name == "Hide Captions":
+                        found["hide"] = c
+                    elif name.startswith(ZOOM_MORE):
+                        found["more"] = c
+                note_meet_label(name)
+            except Exception:
+                continue
+            if want and found[want] is not None:
+                break
+        return found
+
+    def _turn_on(self, found):
+        """Press Show Captions (bar, or More > Show Captions), once per meeting."""
+        key = (self.window.Name or "zoom") if self.window else "zoom"
+        attempt = self.auto.attempt(key)
+        if attempt is None or (found["show"] is None and found["more"] is None):
+            return
+        how, ok = "", False
+        try:
+            if found["show"] is not None:
+                found["show"].GetInvokePattern().Invoke()
+                how, ok = "bar button", True
+            else:
+                menu = found["more"].GetExpandCollapsePattern()
+                menu.Expand()
+                how = "More menu"
+                try:
+                    for _ in range(10):                  # wait for the menu, up to 2 s
+                        time.sleep(0.2)
+                        show = self._scan(self.window, want="show")["show"]
+                        if show is not None:
+                            show.GetInvokePattern().Invoke()
+                            ok = True
+                            break
+                finally:
+                    try:
+                        if menu.ExpandCollapseState != 0:
+                            menu.Collapse()
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.info("Could not turn on Zoom captions: %s", e)
+        self.auto.pressed(key, attempt, how, ok)
+
+    def _texts(self):
+        out = []
+        for c, _ in _walk(self.box, 8):
+            try:
+                if c.ControlTypeName == "TextControl" and (c.Name or "").strip():
+                    out.append(c.Name.strip())
+            except Exception:
+                continue
+        return out
+
+    def poll(self):
+        now = time.time()
+        try:
+            if self.box is None or not self.box.Exists(0, 0):
+                self.box = None
+                if self.window is not None and now - self.box_seen < self.MISSING_SECONDS:
+                    # between lines the box can vanish for a moment
+                    if now - self.last_search >= 1.5:
+                        self.last_search = now
+                        self.box = self._scan(self.window, want="box")["box"]
+                    if self.box is None:
+                        return True
+                else:
+                    if self.window is not None:
+                        log.info("Lost Zoom captions")
+                        self.stream.flush()
+                        self.window = None
+                    if now - self.last_search < 4:
+                        return False
+                    self.last_search = now
+                    self.window = self._find_window()
+                    if self.window is None:
+                        self.status = "Zoom not found"
+                        self._hint_background_tab(now)
+                        return False
+                    found = self._scan(self.window)
+                    if found["box"] is None:
+                        if found["more"] is None and found["show"] is None:
+                            self.status = "Zoom open - not in a meeting"
+                        else:
+                            self.status = "Zoom open - turn on captions (More > Show Captions)"
+                            self._turn_on(found)
+                        self.window = None
+                        return False
+                    self.box = found["box"]
+                    log.info("Connected to Zoom captions")
+                    self.auto.captions_on(self.window.Name or "zoom")
+                    if transcript.count_lines():
+                        transcript.skip_visible = True
+            self.box_seen = now
+            self.stream.feed(self._texts())
+            self.status = "Zoom captions connected"
+            return True
+        except Exception as e:
+            log.info("Lost Zoom captions: %s", e)
+            self.stream.flush()
+            self.reset()
+            self.status = "Zoom captions lost"
+            return False
+
+
+class MacZoomWebReader:
+    """Zoom meetings in the browser on macOS (Chrome, Edge, Brave, Arc, Safari)."""
+    name = "Zoom"
+    MISSING_SECONDS = 8
+
+    def __init__(self):
+        self.window = self.box = None
+        self.last_search = self.box_seen = 0.0
+        self.status = "Zoom not found"
+        self.auto = AutoCaptions("Zoom", "Zoom")
+        self.stream = CaptionStream()
+        self._asked = set()
+
+    def reset(self):
+        self.window = self.box = None
+        self.stream.reset()
+
+    @staticmethod
+    def _label(el):
+        return (str(ax(el, "AXTitle") or "") or str(ax(el, "AXDescription") or "")).strip()
+
+    HINT_EVERY = 120
+
+    def _hint_background_tab(self, now):
+        """A Zoom meeting in a background browser tab can't be read: say so."""
+        if now - getattr(self, "hint_at", 0) < self.HINT_EVERY:
+            return
+        for app in mac_apps(MAC_BROWSERS + ("com.apple.Safari",)):
+            el_app = AXUIElementCreateApplication(app.processIdentifier())
+            for win in ax(el_app, "AXWindows") or []:
+                for el, _ in ax_walk(win, 12):
+                    if ax(el, "AXRole") in ("AXRadioButton", "AXTab") and \
+                            self._label(el).lower().startswith("zoom meeting"):
+                        self.hint_at = now
+                        ui_queue.put(("toast", "Zoom is in a background tab: bring it to "
+                                               "the front so Sidenote can read its captions"))
+                        return
+
+    def _find_window(self):
+        for app in mac_apps(MAC_BROWSERS + ("com.apple.Safari",)):
+            pid = app.processIdentifier()
+            el_app = AXUIElementCreateApplication(pid)
+            if pid not in self._asked:            # ask the browser to expose page content
+                self._asked.add(pid)
+                for flag in ("AXManualAccessibility", "AXEnhancedUserInterface"):
+                    try:
+                        AXUIElementSetAttributeValue(el_app, flag, True)
+                    except Exception:
+                        pass
+            for win in ax(el_app, "AXWindows") or []:
+                if "zoom" in str(ax(win, "AXTitle") or "").lower():
+                    return win
+        return None
+
+    def _scan(self, root, want=None):
+        found = {"box": None, "show": None, "more": None, "hide": None}
+        for el, _ in ax_walk(root, 80):
+            classes = ax(el, "AXDOMClassList") or []
+            if any(ZOOM_CAPTION_BOX in str(c) for c in classes):
+                found["box"] = el
+            elif ax(el, "AXRole") in ("AXButton", "AXPopUpButton", "AXMenuButton"):
+                label = self._label(el)
+                if label == ZOOM_SHOW_CAPTIONS:
+                    found["show"] = el
+                elif label == "Hide Captions":
+                    found["hide"] = el
+                elif label.startswith(ZOOM_MORE):
+                    found["more"] = el
+                note_meet_label(label)
+            if want and found[want] is not None:
+                break
+        return found
+
+    def _turn_on(self, found):
+        key = str(ax(self.window, "AXTitle") or "zoom")
+        attempt = self.auto.attempt(key)
+        if attempt is None or (found["show"] is None and found["more"] is None):
+            return
+        how, ok = "", False
+        try:
+            from ApplicationServices import AXUIElementPerformAction
+            if found["show"] is not None:
+                ok = AXUIElementPerformAction(found["show"], "AXPress") == 0
+                how = "bar button"
+            else:
+                AXUIElementPerformAction(found["more"], "AXPress")       # opens the menu
+                how = "More menu"
+                for _ in range(10):
+                    time.sleep(0.2)
+                    show = self._scan(self.window, want="show")["show"]
+                    if show is not None:
+                        ok = AXUIElementPerformAction(show, "AXPress") == 0
+                        break
+                if self._scan(self.window, want="hide")["hide"] is None and \
+                        self._scan(self.window, want="show")["show"] is not None:
+                    AXUIElementPerformAction(found["more"], "AXPress")   # close the menu
+        except Exception as e:
+            log.info("Could not turn on Zoom captions: %s", e)
+        self.auto.pressed(key, attempt, how, ok)
+
+    def _texts(self):
+        out = []
+        for el, _ in ax_walk(self.box, 8):
+            if ax(el, "AXRole") == "AXStaticText":
+                t = str(ax(el, "AXValue") or "").strip()
+                if t:
+                    out.append(t)
+        return out
+
+    def poll(self):
+        now = time.time()
+        try:
+            if self.box is None or ax(self.box, "AXRole") is None:
+                self.box = None
+                if self.window is not None and now - self.box_seen < self.MISSING_SECONDS:
+                    if now - self.last_search >= 1.5:
+                        self.last_search = now
+                        self.box = self._scan(self.window, want="box")["box"]
+                    if self.box is None:
+                        return True
+                else:
+                    if self.window is not None:
+                        log.info("Lost Zoom captions (macOS)")
+                        self.stream.flush()
+                        self.window = None
+                    if now - self.last_search < 4:
+                        return False
+                    self.last_search = now
+                    self.window = self._find_window()
+                    if self.window is None:
+                        self.status = "Zoom not found"
+                        self._hint_background_tab(now)
+                        return False
+                    found = self._scan(self.window)
+                    if found["box"] is None:
+                        if found["more"] is None and found["show"] is None:
+                            self.status = "Zoom open - not in a meeting"
+                        else:
+                            self.status = "Zoom open - turn on captions (More > Show Captions)"
+                            self._turn_on(found)
+                        self.window = None
+                        return False
+                    self.box = found["box"]
+                    log.info("Connected to Zoom captions (macOS)")
+                    self.auto.captions_on(str(ax(self.window, "AXTitle") or "zoom"))
+                    if transcript.count_lines():
+                        transcript.skip_visible = True
+            self.box_seen = now
+            self.stream.feed(self._texts())
+            self.status = "Zoom captions connected"
+            return True
+        except Exception as e:
+            log.info("Lost Zoom captions (macOS): %s", e)
+            self.stream.flush()
+            self.reset()
+            self.status = "Zoom captions lost"
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Microsoft Teams (the app, or Teams in the browser), Windows and Mac
+# ---------------------------------------------------------------------------
+# Teams labels are translated, so Sidenote uses Teams' element ids, which are
+# the same in every language. Captions: More > Language and speech > Show live
+# captions (a switch). Each caption is a 'ChatMessageCompact' item: name, text.
+TEAMS_IDS = {"more": "callingButtons-showMoreBtn", "lang": "LanguageSpeechMenuControl-id",
+             "cc": "closed-captions-button", "dismiss": "captions-panel-dismiss-button",
+             "hangup": "hangup-button"}
+TEAMS_CAPTION_ITEM = "ChatMessageCompact__body"
+TEAMS_PROCESSES_WIN = ("ms-teams.exe", "teams.exe")
+TEAMS_BUNDLES_MAC = ("com.microsoft.teams2", "com.microsoft.teams")
+
+
+class TeamsReader:
+    """Microsoft Teams meetings on Windows: the Teams app or Teams in a browser."""
+    name = "Microsoft Teams"
+    MISSING_SECONDS = 8          # captions panel gone this long = captions off / lost
+
+    def __init__(self):
+        self.window = self.panel = None
+        self.last_search = self.panel_seen = 0.0
+        self.status = "Teams not found"
+        self.auto = AutoCaptions("Microsoft Teams", "Teams")
+
+    def reset(self):
+        self.window = self.panel = None
+
+    HINT_EVERY = 120
+
+    def _hint_background_tab(self, now):
+        """A Teams meeting in a background browser tab can't be read: say so."""
+        if now - getattr(self, "hint_at", 0) < self.HINT_EVERY:
+            return
+        for win in auto.GetRootControl().GetChildren():
+            try:
+                if win.ClassName not in BROWSER_CLASSES or \
+                        _win_process_name(win.ProcessId) not in ZOOM_BROWSERS_WIN:
+                    continue
+                for c, _ in _walk(win, 12):
+                    if c.ControlTypeName == "TabItemControl" and \
+                            "microsoft teams" in (c.Name or "").lower():
+                        self.hint_at = now
+                        ui_queue.put(("toast", "Teams is in a background tab: bring it to "
+                                               "the front so Sidenote can read its captions"))
+                        return
+            except Exception:
+                continue
+
+    def _windows(self):
+        for win in auto.GetRootControl().GetChildren():
+            try:
+                proc = _win_process_name(win.ProcessId)
+                if proc in TEAMS_PROCESSES_WIN or (
+                        win.ClassName in BROWSER_CLASSES and proc in ZOOM_BROWSERS_WIN
+                        and "microsoft teams" in (win.Name or "").lower()):
+                    yield win
+            except Exception:
+                continue
+
+    def _scan(self, root, want=None):
+        found = {k: None for k in TEAMS_IDS}
+        ids = {v: k for k, v in TEAMS_IDS.items()}
+        for c, _ in _walk(root, 90):
+            try:
+                key = ids.get(c.AutomationId or "")
+                if key and found[key] is None:
+                    found[key] = c
+                note_meet_label(c.Name or "")
+            except Exception:
+                continue
+            if want and found[want] is not None:
+                break
+        return found
+
+    @staticmethod
+    def _panel_of(dismiss):
+        parent = dismiss.GetParentControl()
+        return parent.GetParentControl() if parent is not None else None
+
+    def _turn_on(self, found):
+        """More > Language and speech > live captions switch, once per meeting."""
+        key = self.window.Name or "teams"
+        attempt = self.auto.attempt(key)
+        if attempt is None or found["more"] is None:
+            return
+        how, ok, opened = "More > Language and speech", False, []
+        try:
+            more = found["more"].GetExpandCollapsePattern()
+            more.Expand()
+            opened.append(more)
+            lang = None
+            for _ in range(10):
+                time.sleep(0.2)
+                lang = self._scan(self.window, want="lang")["lang"]
+                if lang is not None:
+                    break
+            if lang is not None:
+                sub = lang.GetExpandCollapsePattern()
+                sub.Expand()
+                opened.append(sub)
+                for _ in range(10):
+                    time.sleep(0.2)
+                    cc = self._scan(self.window, want="cc")["cc"]
+                    if cc is not None:
+                        toggle = cc.GetTogglePattern()
+                        if toggle.ToggleState == 0:
+                            toggle.Toggle()
+                        ok = True
+                        break
+        except Exception as e:
+            log.info("Could not turn on Teams captions: %s", e)
+        finally:
+            for menu in reversed(opened):           # close the menus again
+                try:
+                    if menu.ExpandCollapseState != 0:
+                        menu.Collapse()
+                except Exception:
+                    pass
+        self.auto.pressed(key, attempt, how, ok)
+
+    def _blocks(self):
+        blocks = []
+        for c, _ in _walk(self.panel, 25):
+            try:
+                if TEAMS_CAPTION_ITEM not in (c.ClassName or ""):
+                    continue
+                texts = [t.Name.strip() for t, _ in _walk(c, 6)
+                         if t.ControlTypeName == "TextControl" and (t.Name or "").strip()]
+            except Exception:
+                continue
+            if len(texts) >= 2:
+                blocks.append((texts[0], " ".join(texts[1:])))
+            elif texts:
+                blocks.append(("", texts[0]))
+        return blocks
+
+    def poll(self):
+        now = time.time()
+        try:
+            if self.panel is None or not self.panel.Exists(0, 0):
+                self.panel = None
+                if self.window is not None and now - self.panel_seen < self.MISSING_SECONDS:
+                    if now - self.last_search >= 1.5:
+                        self.last_search = now
+                        dismiss = self._scan(self.window, want="dismiss")["dismiss"]
+                        self.panel = self._panel_of(dismiss) if dismiss is not None else None
+                    if self.panel is None:
+                        return True
+                else:
+                    if self.window is not None:
+                        log.info("Lost Teams captions")
+                        self.window = None
+                    if now - self.last_search < 4:
+                        return False
+                    self.last_search = now
+                    found = None
+                    for win in self._windows():
+                        f = self._scan(win)
+                        if f["hangup"] is not None or f["dismiss"] is not None:
+                            self.window, found = win, f
+                            break
+                    if found is None:
+                        self.status = "Teams not found"
+                        self._hint_background_tab(now)
+                        return False
+                    if found["dismiss"] is None:
+                        self.status = "Teams open - turn on live captions (More > Language and speech)"
+                        self._turn_on(found)
+                        self.window = None
+                        return False
+                    self.panel = self._panel_of(found["dismiss"])
+                    log.info("Connected to Teams captions")
+                    self.auto.captions_on(self.window.Name or "teams")
+                    if transcript.count_lines():
+                        transcript.skip_visible = True
+            self.panel_seen = now
+            transcript.ingest_blocks(self._blocks())
+            self.status = "Microsoft Teams captions connected"
+            return True
+        except Exception as e:
+            log.info("Lost Teams captions: %s", e)
+            self.reset()
+            self.status = "Microsoft Teams captions lost"
+            return False
+
+
+class MacTeamsReader:
+    """Microsoft Teams meetings on macOS: the Teams app or Teams in a browser."""
+    name = "Microsoft Teams"
+    MISSING_SECONDS = 8
+
+    def __init__(self):
+        self.window = self.panel = None
+        self.last_search = self.panel_seen = 0.0
+        self.status = "Teams not found"
+        self.auto = AutoCaptions("Microsoft Teams", "Teams")
+        self._asked = set()
+
+    def reset(self):
+        self.window = self.panel = None
+
+    HINT_EVERY = 120
+
+    def _hint_background_tab(self, now):
+        """A Teams meeting in a background browser tab can't be read: say so."""
+        if now - getattr(self, "hint_at", 0) < self.HINT_EVERY:
+            return
+        for app in mac_apps(MAC_BROWSERS + ("com.apple.Safari",)):
+            el_app = AXUIElementCreateApplication(app.processIdentifier())
+            for win in ax(el_app, "AXWindows") or []:
+                for el, _ in ax_walk(win, 12):
+                    label = (str(ax(el, "AXTitle") or "") or str(ax(el, "AXDescription") or ""))
+                    if ax(el, "AXRole") in ("AXRadioButton", "AXTab") and \
+                            "microsoft teams" in label.lower():
+                        self.hint_at = now
+                        ui_queue.put(("toast", "Teams is in a background tab: bring it to "
+                                               "the front so Sidenote can read its captions"))
+                        return
+
+    def _windows(self):
+        browsers = MAC_BROWSERS + ("com.apple.Safari",)
+        for app in mac_apps(TEAMS_BUNDLES_MAC + browsers):
+            pid = app.processIdentifier()
+            el_app = AXUIElementCreateApplication(pid)
+            if pid not in self._asked:            # ask the app to expose its web content
+                self._asked.add(pid)
+                for flag in ("AXManualAccessibility", "AXEnhancedUserInterface"):
+                    try:
+                        AXUIElementSetAttributeValue(el_app, flag, True)
+                    except Exception:
+                        pass
+            in_browser = str(app.bundleIdentifier()) in browsers
+            for win in ax(el_app, "AXWindows") or []:
+                if not in_browser or "microsoft teams" in str(ax(win, "AXTitle") or "").lower():
+                    yield win
+
+    def _scan(self, root, want=None):
+        found = {k: None for k in TEAMS_IDS}
+        ids = {v: k for k, v in TEAMS_IDS.items()}
+        for el, _ in ax_walk(root, 90):
+            key = ids.get(str(ax(el, "AXDOMIdentifier") or ""))
+            if key and found[key] is None:
+                found[key] = el
+            note_meet_label(str(ax(el, "AXDescription") or "") or str(ax(el, "AXTitle") or ""))
+            if want and found[want] is not None:
+                break
+        return found
+
+    @staticmethod
+    def _panel_of(dismiss):
+        parent = ax(dismiss, "AXParent")
+        return ax(parent, "AXParent") if parent is not None else None
+
+    def _turn_on(self, found):
+        key = str(ax(self.window, "AXTitle") or "teams")
+        attempt = self.auto.attempt(key)
+        if attempt is None or found["more"] is None:
+            return
+        how, ok = "More > Language and speech", False
+        try:
+            from ApplicationServices import AXUIElementPerformAction
+            AXUIElementPerformAction(found["more"], "AXPress")          # opens the menu
+            lang = cc = None
+            for _ in range(10):
+                time.sleep(0.2)
+                lang = self._scan(self.window, want="lang")["lang"]
+                if lang is not None:
+                    break
+            if lang is not None:
+                for action in ("AXPress", "AXShowMenu"):               # opens the submenu
+                    AXUIElementPerformAction(lang, action)
+                    for _ in range(5):
+                        time.sleep(0.2)
+                        cc = self._scan(self.window, want="cc")["cc"]
+                        if cc is not None:
+                            break
+                    if cc is not None:
+                        break
+            if cc is not None:
+                if str(ax(cc, "AXValue")) in ("0", "False", "None"):
+                    AXUIElementPerformAction(cc, "AXPress")
+                ok = True
+            if self._scan(self.window, want="lang")["lang"] is not None:
+                AXUIElementPerformAction(found["more"], "AXPress")      # close the menu
+        except Exception as e:
+            log.info("Could not turn on Teams captions: %s", e)
+        self.auto.pressed(key, attempt, how, ok)
+
+    def _blocks(self):
+        blocks = []
+        for el, _ in ax_walk(self.panel, 25):
+            classes = ax(el, "AXDOMClassList") or []
+            if not any(TEAMS_CAPTION_ITEM in str(c) for c in classes):
+                continue
+            texts = [str(ax(t, "AXValue") or "").strip() for t, _ in ax_walk(el, 6)
+                     if ax(t, "AXRole") == "AXStaticText"]
+            texts = [x for x in texts if x]
+            if len(texts) >= 2:
+                blocks.append((texts[0], " ".join(texts[1:])))
+            elif texts:
+                blocks.append(("", texts[0]))
+        return blocks
+
+    def poll(self):
+        now = time.time()
+        try:
+            if self.panel is None or ax(self.panel, "AXRole") is None:
+                self.panel = None
+                if self.window is not None and now - self.panel_seen < self.MISSING_SECONDS:
+                    if now - self.last_search >= 1.5:
+                        self.last_search = now
+                        dismiss = self._scan(self.window, want="dismiss")["dismiss"]
+                        self.panel = self._panel_of(dismiss) if dismiss is not None else None
+                    if self.panel is None:
+                        return True
+                else:
+                    if self.window is not None:
+                        log.info("Lost Teams captions (macOS)")
+                        self.window = None
+                    if now - self.last_search < 4:
+                        return False
+                    self.last_search = now
+                    found = None
+                    for win in self._windows():
+                        f = self._scan(win)
+                        if f["hangup"] is not None or f["dismiss"] is not None:
+                            self.window, found = win, f
+                            break
+                    if found is None:
+                        self.status = "Teams not found"
+                        self._hint_background_tab(now)
+                        return False
+                    if found["dismiss"] is None:
+                        self.status = "Teams open - turn on live captions (More > Language and speech)"
+                        self._turn_on(found)
+                        self.window = None
+                        return False
+                    self.panel = self._panel_of(found["dismiss"])
+                    log.info("Connected to Teams captions (macOS)")
+                    self.auto.captions_on(str(ax(self.window, "AXTitle") or "teams"))
+                    if transcript.count_lines():
+                        transcript.skip_visible = True
+            self.panel_seen = now
+            transcript.ingest_blocks(self._blocks())
+            self.status = "Microsoft Teams captions connected"
+            return True
+        except Exception as e:
+            log.info("Lost Teams captions (macOS): %s", e)
+            self.reset()
+            self.status = "Microsoft Teams captions lost"
+            return False
+
+
 class MicTranscriber:
     """Mac: transcribes the user's own microphone on the computer (Whisper), while
     macOS Live Captions hears the other people (it listens to one source at a
@@ -2212,54 +3025,63 @@ def retry_mic():
 def captions_loop():
     """Picks the best caption source and keeps reading it.
 
-    Prefers Google Meet (has speaker names). If Meet is not available, or its
-    captions are lost for a few seconds, switches to Windows Live Captions."""
+    Prefers captions with speaker names: Google Meet, Zoom in the browser,
+    then Microsoft Teams (app or browser).
+    If neither is available, or its captions are lost for a few seconds, uses
+    the computer's Live Captions (plus the user's mic on Mac)."""
     with uia_thread():
         meet = MacMeetReader() if IS_MAC else MeetReader()
+        zoom = MacZoomWebReader() if IS_MAC else ZoomWebReader()
+        teams = MacTeamsReader() if IS_MAC else TeamsReader()
+        named = (meet, zoom, teams)
         windows = MacLiveCaptionsReader() if IS_MAC else LiveCaptionsReader()
         active = None              # reader currently feeding the transcript
-        meet_lost_since = None
+        lost_since = None
         while True:
             if IS_MAC and MAC_MIC_ENABLED:
-                update_mic(active is not None and active is not meet)
+                update_mic(active is not None and active not in named)
             if not window_open.is_set():
-                meet.reset(); windows.reset()
-                meet.auto.clear()
+                for reader in named:
+                    reader.reset()
+                    reader.auto.clear()
+                windows.reset()
                 active = None
                 transcript.status = "Sidenote closed"
                 transcript.source = ""
                 time.sleep(POLL_SECONDS)
                 continue
 
-            if active is meet:
-                if meet.poll():
-                    meet_lost_since = None
+            if active in named:
+                if active.poll():
+                    lost_since = None
                 else:
-                    meet_lost_since = meet_lost_since or time.time()
-                    if time.time() - meet_lost_since > 6:
+                    lost_since = lost_since or time.time()
+                    if time.time() - lost_since > 6:
+                        lost = active.name
                         active = windows
                         windows.reset()
                         transcript.pending = ""
                         transcript.skip_visible = True   # don't copy old on-screen text
                         captions_win.ensure_running()
-                        transcript.source_note = f"Meet captions lost, switched to {LC_SHORT}"
-                        ui_queue.put(("toast", f"Meet captions lost \u00b7 switched to {LC_SHORT}"))
+                        transcript.source_note = f"{lost} captions lost, switched to {LC_SHORT}"
+                        ui_queue.put(("toast", f"{lost} captions lost \u00b7 switched to {LC_SHORT}"))
                         log.info("Fell back to %s", LC_NAME)
             else:
-                # Try Meet every few seconds; use it as soon as it works
-                if meet.poll():
-                    if active is not meet:
+                # Try Meet, Zoom and Teams every few seconds; use one as soon as it works
+                for reader in named:
+                    if reader.poll():
                         transcript.pending = ""
-                    active = meet
-                    meet_lost_since = None
-                    transcript.source_note = ""
-                    ui_queue.put(("toast", "Connected to Google Meet captions"))
+                        active = reader
+                        lost_since = None
+                        transcript.source_note = ""
+                        ui_queue.put(("toast", f"Connected to {reader.name} captions"))
+                        break
                 else:
                     if active is None:
                         active = windows
                     windows.poll()
 
-            if active is meet and not IS_MAC:
+            if active in named and not IS_MAC:
                 try:
                     lc = _lc_window()
                     if lc is not None:
@@ -2331,6 +3153,135 @@ def debug_dump_live_captions(path):
     return path
 
 
+# Capturing Teams and Zoom windows, to build caption readers for them
+CALL_APPS = {
+    # app: (Mac bundle ids, Windows process names, window-title words, in a browser?)
+    "teams": (("com.microsoft.teams2", "com.microsoft.teams") +
+              (MAC_BROWSERS + ("com.apple.Safari", "org.mozilla.firefox") if IS_MAC else ()),
+              ("ms-teams.exe", "teams.exe"), ("microsoft teams",), True),
+    "zoom": (MAC_BROWSERS + ("com.apple.Safari", "org.mozilla.firefox", "us.zoom.xos")
+             if IS_MAC else (),
+             ("zoom.exe",), ("zoom",), True),
+}
+CAPTION_HINTS = ("caption", "transcript", "subtitle", "cc ", "live caption")
+
+
+def _win_process_name(pid):
+    """Executable name of a Windows process ('ms-teams.exe'), or ''."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)   # query limited info
+        if not handle:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return os.path.basename(buf.value).lower()
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return ""
+
+
+def debug_dump_call_app(path, app):
+    """Write the accessibility tree of the Teams or Zoom (browser) windows to a
+    file, with a summary of caption-like elements first. Used to build their
+    readers. Privacy: other windows are not named, and for browsers only the web
+    page is captured (never bookmarks, tabs, extensions or the profile)."""
+    bundles, processes, title_words, browser = CALL_APPS[app]
+    lines, hints = [], []
+    found = [0]
+
+    def note(depth, text):
+        found[0] += 1
+        lines.append(f"{'  ' * min(depth, 30)}{text}")
+        if any(h in text.lower() for h in CAPTION_HINTS) and len(hints) < 60:
+            hints.append(f"line {len(lines)}: {text.strip()[:160]}")
+
+    if IS_MAC:
+        browsers = MAC_BROWSERS + ("com.apple.Safari", "org.mozilla.firefox")
+        lines.append(f"Accessibility allowed: {mac_trusted(prompt=True)}")
+        for running in mac_apps(bundles):
+            el_app = AXUIElementCreateApplication(running.processIdentifier())
+            for flag in ("AXManualAccessibility", "AXEnhancedUserInterface"):
+                try:
+                    AXUIElementSetAttributeValue(el_app, flag, True)    # expose web content
+                except Exception:
+                    pass
+            time.sleep(1.5)
+            in_browser = str(running.bundleIdentifier()) in browsers
+            for win in ax(el_app, "AXWindows") or []:
+                title = str(ax(win, "AXTitle") or "")
+                if title_words and in_browser and not any(w in title.lower() for w in title_words):
+                    continue
+                lines.append(f"===== {running.localizedName()} "
+                             f"({running.bundleIdentifier()}) window {title!r} =====")
+                # In a browser, only the web page: never bookmarks, tabs or profile
+                roots = [el for el, _ in ax_walk(win, 40) if ax(el, "AXRole") == "AXWebArea"] \
+                    if in_browser else [win]
+                if in_browser and not roots:
+                    lines.append("(the page content is not exposed yet: try again in a few seconds)")
+                for root in roots:
+                    for el, d in ax_walk(root, 70):
+                        if len(lines) > 20000:
+                            lines.append("... truncated")
+                            break
+                        note(d, f"{ax(el, 'AXRole')} title={str(ax(el, 'AXTitle'))[:60]!r} "
+                                f"desc={str(ax(el, 'AXDescription'))[:60]!r} "
+                                f"value={str(ax(el, 'AXValue'))[:160]!r} "
+                                f"id={str(ax(el, 'AXIdentifier'))[:40]!r}")
+    else:
+        with auto.UIAutomationInitializerInThread():
+            targets, others = [], 0
+            for w in auto.GetRootControl().GetChildren():
+                try:
+                    proc = _win_process_name(w.ProcessId)
+                    title = (w.Name or "").lower()
+                    in_browser = w.ClassName in BROWSER_CLASSES + ("MozillaWindowClass",) \
+                        and proc not in ("code.exe", "claude.exe", "spotify.exe")
+                    if proc in processes:
+                        targets.append((w, False))
+                    elif browser and in_browser and any(t in title for t in title_words):
+                        targets.append((w, True))
+                    else:
+                        others += 1
+                except Exception:
+                    continue
+            lines.append(f"Windows captured: {len(targets)}; other windows (not captured): {others}")
+
+            def pages(win):
+                return [c for c, _ in _walk(win, 40) if c.ControlTypeName == "DocumentControl"]
+
+            for win, in_browser in targets:
+                lines += ["", f"===== {win.Name!r} [{win.ClassName}] ====="]
+                if in_browser:
+                    pages(win)                   # first look makes Chrome expose the page
+                    time.sleep(2.0)
+                roots = pages(win) if in_browser else [win]
+                if in_browser and not roots:
+                    lines.append("(the page content is not exposed yet: try again in a few seconds)")
+                for root in roots:
+                    for control, depth in _walk(root, 60):
+                        if len(lines) > 20000:
+                            lines.append("... truncated")
+                            break
+                        try:
+                            name = (control.Name or "").replace("\n", " ")[:160]
+                            note(depth, f"{control.ControlTypeName} name={name!r} "
+                                        f"id={control.AutomationId!r} class={control.ClassName!r}")
+                        except Exception:
+                            continue
+    summary = [f"Sidenote {SIDENOTE_VERSION} - {app} window capture, "
+               f"{'macOS' if IS_MAC else 'Windows'}",
+               f"Caption-like elements ({len(hints)}):"] + hints + ["", "Full tree:"]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(summary + lines))
+    return path, found[0], len(hints)
+
+
 def debug_dump_meet(path):
     """Write the UI tree of the Meet window to a file (for troubleshooting)."""
     if IS_MAC:
@@ -2372,7 +3323,8 @@ mcp = FastMCP(
     "sidenote",
     instructions=(
         "You are Sidenote, a live meeting assistant for the user. The transcript comes "
-        "from Google Meet captions (lines start with the speaker's name; the user's own "
+        "from Google Meet, Zoom (browser) or Microsoft Teams captions (lines start with the "
+        "speaker's name when the app shows it; the user's own "
         "lines show the user's name, or 'You' while it is unknown) or, as a fallback, "
         "the computer's Live Captions (no names; on Mac the lines are 'Others' and the "
         "user's own microphone lines carry the user's name). The meeting "
@@ -2871,6 +3823,25 @@ def core_save_recap(recap="", summary="", by_person="", decisions="", open_quest
     return f"Recap saved in {transcript.file_path}"
 
 
+def core_debug_call_window(app="teams"):
+    app = str(app or "").strip().lower()
+    app = "teams" if "team" in app else "zoom" if "zoom" in app else app
+    if app not in CALL_APPS:
+        return "Say which app: 'teams' or 'zoom'."
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    path = os.path.join(SAVE_DIR, f"capture_{app}_{'mac' if IS_MAC else 'windows'}.txt")
+    path, count, hints = debug_dump_call_app(path, app)
+    if count == 0:
+        where = ("the Teams app" if app == "teams" else "Zoom in the browser (Chrome, Edge, "
+                 "Safari or Firefox; the tab title must contain 'Zoom')")
+        return (f"Couldn't find {where}. Open the meeting with captions on, then try again. "
+                f"(Saved what was found to {path}.)")
+    return (f"Saved the {app.capitalize()} window structure to {path} ({count} lines, "
+            f"{hints} caption-like elements). Tell the user to send this file to the "
+            "Sidenote developer. Note for the user: it contains the text visible in that "
+            "window (captions and names), and stays on their computer until they send it.")
+
+
 def core_debug_meet_tree():
     path = os.path.join(SAVE_DIR, "debug_meet_tree.txt")
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -2931,6 +3902,7 @@ OPS = {
     "add_context_item": core_add_context_item,
     "get_meeting_context": core_get_meeting_context,
     "debug_meet_tree": core_debug_meet_tree,
+    "debug_call_window": core_debug_call_window,
     "debug_live_captions_tree": core_debug_live_captions_tree,
     "show_suggestion": core_show_suggestion,
     "start_new_meeting": core_start_new_meeting,
@@ -3131,6 +4103,16 @@ async def debug_meet_tree() -> str:
     """Troubleshooting: save the structure of the Google Meet window to a file in
     Documents/Sidenote, to fix reading Meet captions."""
     return await run("debug_meet_tree")
+
+
+@mcp.tool()
+async def debug_call_window(app: str = "teams") -> str:
+    """Troubleshooting / development: save the structure of the Microsoft Teams
+    app window (app='teams') or a Zoom meeting open in the browser (app='zoom')
+    to a file in Documents/Sidenote, so Sidenote can learn to read their
+    captions with speaker names. Use when the user asks to capture the Teams or
+    Zoom window. Best done during a call with captions turned on."""
+    return await run("debug_call_window", app=app)
 
 
 @mcp.tool()
@@ -4096,7 +5078,7 @@ class Overlay:
         return "Claude not connected · type 'continue' in the Claude app", FAINT
 
     def _mic_fixable(self):
-        return IS_MAC and mic.status in MIC_NEEDS_USER and transcript.source != "Google Meet"
+        return IS_MAC and mic.status in MIC_NEEDS_USER and transcript.source not in NAMED_SOURCES
 
     def _footer_click(self):
         if self._mic_fixable():
@@ -4106,10 +5088,10 @@ class Overlay:
     def _captions_state(self):
         """Footer, right side: which transcript source is active and its health."""
         status, source = transcript.status, transcript.source
-        if source == "Google Meet":
-            if status.startswith("Google Meet captions connected"):
-                return "Google Meet captions", OK
-            return "Google Meet \u00b7 reconnecting", WARN
+        if source in NAMED_SOURCES:
+            if status.startswith(f"{source} captions connected"):
+                return f"{source} captions", OK
+            return f"{source} \u00b7 reconnecting", WARN
         if captions_win.note:
             return "Live Captions is docked: set it to 'Floating on screen'", WARN
         label = LC_SHORT

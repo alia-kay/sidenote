@@ -22,7 +22,9 @@ How it works: Sidenote is a local MCP server for the Claude desktop app, on Wind
 
 - Google Meet captions in Chrome or Edge, with speaker names (Windows and Mac). This is the preferred source.
 - Sidenote turns on Meet captions by itself. It presses the CC button and the "Turn on captions" item in its menu, without moving the mouse or pressing keys. It tries at most 2 times per meeting. If you turn captions off on purpose, it leaves them off.
-- Windows Live Captions as a fallback, for Zoom, Teams, videos and any other app. It can include your own microphone.
+- Zoom meetings in the browser (Zoom's web client), Windows and Mac: Sidenote turns on Zoom's captions (Show Captions, on the bar or under More, once per meeting) and reads the rolling caption line. Speaker names are used when Zoom shows them. The Zoom tab must be in front; a toast says so if it's in a background tab.
+- Microsoft Teams meetings, in the Teams app or in the browser, Windows and Mac: Sidenote turns on Teams' live captions (More > Language and speech, once per meeting) and reads them with speaker names. It uses Teams' element ids, so it works in any Teams language. The user's own Teams display name is treated as the user.
+- Windows Live Captions as a fallback, for the Zoom app, videos and any other app. It can include your own microphone.
 - macOS Live Captions as a fallback on Mac. Sidenote turns it on by itself, hides its window, and switches it off when Sidenote closes. It hears the other people; the user's own voice comes from the microphone, transcribed on the Mac with Whisper (through Claude's microphone permission; Sidenote asks macOS for it, and says so in the footer if access is blocked or the mic gives only silence).
 - If Meet captions are lost, Sidenote switches to Live Captions automatically.
 

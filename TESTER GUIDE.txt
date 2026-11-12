@@ -86,6 +86,32 @@ TRY IT IN A GOOGLE MEET CALL
      screenshot for me.
 
 
+8c. Zoom in the browser:
+   - Join a Zoom meeting in Chrome (on the Zoom invite page choose "Join
+     from your browser"). Keep the Zoom tab in front: browsers only let
+     Sidenote read the tab on screen.
+   - Type "open Sidenote" in a Claude chat. Within a few seconds Sidenote
+     turns on Zoom's captions by itself (More > Show Captions) and the
+     bottom line says "Zoom captions". Talk a little and check the
+     Transcript view. If someone else joins, check whether names appear.
+   - If it doesn't work, while captions are on screen type in the Claude
+     chat:  capture the Zoom window  and send me the file it saves
+     (Documents/Sidenote/capture_zoom_mac.txt).
+
+8d. Microsoft Teams (the Teams app, and Teams in Chrome if you can):
+   - Join a Teams meeting and type "open Sidenote" in a Claude chat. Within
+     a few seconds Sidenote turns on Teams' live captions by itself (More >
+     Language and speech) and the bottom line says "Microsoft Teams
+     captions". Talk a little: your lines should appear under your name.
+     (Teams may also open its "Caption styles" panel the first time; that
+     comes from Teams, you can close it.)
+   - If it doesn't work, while captions are on screen type in the Claude
+     chat:  capture the Teams window  and send me the file it saves
+     (Documents/Sidenote/capture_teams_mac.txt). It contains the text shown
+     in the Teams window (captions, names, and chats visible in that window),
+     nothing from other windows.
+
+
 CHECK THE VERSION
 
 9. In the Claude chat, ask:
