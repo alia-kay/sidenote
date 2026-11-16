@@ -1,5 +1,5 @@
 SIDENOTE - TESTER GUIDE (Mac)
-Version 2026-11-12 v10
+Version 2026-11-16 v11
 
 Sidenote is a small window that sits next to your meeting. It reads the
 meeting captions and lets you ask Claude about the meeting while it happens.
@@ -7,7 +7,7 @@ Meeting notes are saved only on your Mac, in Documents/Sidenote.
 
 You need: a Mac with the latest macOS, Google Chrome, the Claude desktop app
 (signed in), an internet connection, and the file
-Sidenote-2026-11-12-v10.mcpb.
+Sidenote-2026-11-16-v11.mcpb.
 
 
 BEFORE YOU START
@@ -18,7 +18,7 @@ BEFORE YOU START
 
 INSTALL
 
-2. Double-click Sidenote-2026-11-12-v10.mcpb. Claude opens and shows the
+2. Double-click Sidenote-2026-11-16-v11.mcpb. Claude opens and shows the
    Sidenote extension. Click Install.
    (Or open Claude > Settings > Extensions and drag the file into the window.)
 
@@ -124,7 +124,7 @@ CHECK THE VERSION
 
 9. In the Claude chat, ask:
        What's Sidenote's status?
-   The answer ends with "Version: 2026-11-12 v10". The Sidenote window title
+   The answer ends with "Version: 2026-11-16 v11". The Sidenote window title
    shows the same version.
 
 

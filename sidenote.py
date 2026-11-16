@@ -33,6 +33,42 @@ import tkinter as tk
 import contextlib
 
 IS_MAC = sys.platform == "darwin"
+
+
+def fix_tcl_tk_paths(base=None, environ=None):
+    """In a virtual environment made from a uv-managed Python (the Mac extension),
+    Tk can't find its own Tcl/Tk script folders and the window fails to open
+    ("Can't find a usable init.tcl"). Point it at the folders of the Python the
+    environment was made from. Only fills in what isn't set already; never on
+    Windows (it finds them there). Returns what it set."""
+    import glob
+    environ = os.environ if environ is None else environ
+    if base is None and (sys.platform == "win32" or sys.prefix == sys.base_prefix):
+        return {}                                       # Windows, or not a venv
+    roots = [base] if base else list(dict.fromkeys(
+        [sys.base_prefix, os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))]))
+    major = str(tk.TclVersion).split(".")[0]            # "8" (8.6) or "9" (9.0)
+    wanted = {"TCL_LIBRARY": ("tcl", "init.tcl"), "TK_LIBRARY": ("tk", "tk.tcl")}
+    done = {}
+    for var, (name, marker) in wanted.items():
+        current = environ.get(var, "")
+        if current and os.path.isfile(os.path.join(current, marker)):
+            continue                                    # already set and working
+        for root in roots:
+            hits = sorted(glob.glob(os.path.join(root, "lib", f"{name}{major}.*", marker)) +
+                          glob.glob(os.path.join(root, "share", "tcltk", f"{name}{major}.*", marker)),
+                          reverse=True)
+            if hits:
+                environ[var] = done[var] = os.path.dirname(hits[0])
+                break
+    return done
+
+
+try:
+    _tcl_set = fix_tcl_tk_paths()
+except Exception:                                       # never stop Sidenote over this
+    _tcl_set = {}
+
 if IS_MAC:
     auto = None
 else:
@@ -46,6 +82,8 @@ except ImportError:  # mcp 1.x
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="%(asctime)s [sidenote] %(message)s")
 log = logging.getLogger("sidenote")
+if _tcl_set:
+    log.info("Tcl/Tk folders set for this Python: %s", _tcl_set)
 
 POLL_SECONDS = 0.5
 SAVE_DIR = os.path.join(os.path.expanduser("~"), "Documents", "Sidenote")
@@ -2093,7 +2131,7 @@ def meet_key(title):
     return m.group(0) if m else (title or "").lower()
 
 
-SIDENOTE_VERSION = "2026-11-12 v10"
+SIDENOTE_VERSION = "2026-11-16 v11"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -4845,16 +4883,30 @@ def handle_peer(conn):
         conn.close()
 
 
+def _forward(op, kwargs):
+    conn = Client(PEER_ADDRESS, authkey=PEER_AUTHKEY)
+    try:
+        conn.send((op, kwargs))
+        return conn.recv()
+    finally:
+        conn.close()
+
+
 def call(op, kwargs):
     if role["primary"]:
         return OPS[op](**kwargs)
     try:
-        conn = Client(PEER_ADDRESS, authkey=PEER_AUTHKEY)
-        try:
-            conn.send((op, kwargs))
-            return conn.recv()
-        finally:
-            conn.close()
+        kwargs = dict(kwargs)
+        while True:
+            result = _forward(op, kwargs)
+            # The window may belong to an older Sidenote that doesn't know a newer
+            # field (e.g. user_name): send the call again without it.
+            m = (re.search(r"unexpected keyword argument '(\w+)'", result)
+                 if isinstance(result, str) and result.startswith(f"Error in {op}:") else None)
+            if not m or m.group(1) not in kwargs:
+                return result
+            log.info("The running Sidenote is older: %s sent without %s", op, m.group(1))
+            kwargs.pop(m.group(1))
     except (OSError, EOFError):
         return ("Sidenote's overlay is restarting. Wait a few seconds and try again; "
                 "if it persists, restart the Claude app.")
