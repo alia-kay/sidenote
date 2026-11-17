@@ -103,6 +103,7 @@ open_sidenote, close_sidenote, wait_for_question, show_suggestion, update_meetin
 - Mac text is 50% larger in v15: Tk on macOS draws a 9 pt font as 9 px and ignores 'tk scaling' for fonts, so every font size goes through fs(). The window and spacing stay as in v13 (scaling 1.45); v14's wider window is undone.
 - Open lists always show at least 5 lines (measured from the drawn lines, not estimated); a window too short for that grows taller, up to the screen.
 - If macOS only applies the Accessibility switch to a new process, the footer says to quit and reopen Claude.
+- Closing Sidenote switches macOS Live Captions off reliably (v16): Sidenote waits up to 15 s when System Settings has to start, checks the saved switch afterwards and retries once; Claude ending Sidenote with SIGTERM also runs this.
 - Mac mic (v15): the hearing line shows your words while you talk (a quick Whisper pass every 1.5 s of speech); a phrase is saved after a pause or at 8 s (was 12 s, which with call audio from the speakers meant a 12 s delay).
 - Only one copy of Sidenote owns the window. Other chats talk to it locally (127.0.0.1).
 

@@ -1891,18 +1891,25 @@ class MacCaptionsWindow:
         was_open = bool(settings_apps())
         subprocess.run(["open", "-g", self.SETTINGS_URL])
         switch, how = None, ""
-        for _ in range(30):                               # up to ~6 s and more
-            time.sleep(0.2)
+        # Settings already open: a few seconds. Started from scratch it can take
+        # well over 6 s before its window can be read (that left Live Captions on).
+        deadline = time.time() + (6 if was_open else 15)
+        window_seen = asked_again = None
+        while switch is None and time.time() < deadline:
+            time.sleep(0.25)
             for app in settings_apps():
                 el = AXUIElementCreateApplication(app.processIdentifier())
                 for w in ax(el, "AXWindows") or []:
+                    window_seen = window_seen or time.time()
                     switch, how = self._find_switch(w)
                     if switch is not None:
                         break
                 if switch is not None:
                     break
-            if switch is not None:
-                break
+            if switch is None and window_seen and not asked_again and \
+                    time.time() - window_seen > 2:
+                asked_again = True                        # opened on another page
+                subprocess.run(["open", "-g", self.SETTINGS_URL])
         changed = False
         if switch is not None:
             if bool(ax(switch, "AXValue")) != on:
@@ -2014,8 +2021,16 @@ class MacCaptionsWindow:
         if self._window() is not None:
             self.show_now()
         try:
-            self._set_enabled(False)
-            log.info("Turned off Live Captions")
+            if self.enabled() is False:
+                return                                    # already off: nothing to do
+            for attempt in (1, 2):
+                self._set_enabled(False)
+                if self.enabled() is not True:
+                    log.info("Turned off Live Captions")
+                    return
+                log.info("Live Captions still on after try %d", attempt)
+            ui_queue.put(("toast", "Couldn't turn off Live Captions: System Settings > "
+                                   "Accessibility > Live Captions"))
         except Exception as e:
             log.info("Could not turn off Live Captions: %s", e)
 
@@ -8357,6 +8372,12 @@ def main():
         if not server.is_alive():
             return
         time.sleep(2)
+    # Ended by a signal (Claude quitting): exit normally so the atexit steps run.
+    try:
+        import signal
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    except Exception:
+        pass
     # On exit (e.g. Claude quits): put Live Captions back on screen, then close it.
     # atexit runs these in reverse order, so show_now runs before the close.
     atexit.register(captions_win.close_live_captions)
