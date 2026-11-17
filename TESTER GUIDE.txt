@@ -1,5 +1,5 @@
 SIDENOTE - TESTER GUIDE (Mac)
-Version 2026-11-17 v12
+Version 2026-11-17 v16
 
 Sidenote is a small window that sits next to your meeting. It reads the
 meeting captions and lets you ask Claude about the meeting while it happens.
@@ -7,7 +7,7 @@ Meeting notes are saved only on your Mac, in Documents/Sidenote.
 
 You need: a Mac with the latest macOS, Google Chrome, the Claude desktop app
 (signed in), an internet connection, and the file
-Sidenote-2026-11-17-v12.mcpb.
+Sidenote-2026-11-17-v16.mcpb.
 
 
 BEFORE YOU START
@@ -18,7 +18,7 @@ BEFORE YOU START
 
 INSTALL
 
-2. Double-click Sidenote-2026-11-17-v12.mcpb. Claude opens and shows the
+2. Double-click Sidenote-2026-11-17-v16.mcpb. Claude opens and shows the
    Sidenote extension. Click Install.
    (Or open Claude > Settings > Extensions and drag the file into the window.)
 
@@ -37,15 +37,28 @@ FIRST START
    "Always allow".
 
 6. macOS asks for two permissions. Please allow both:
-   a. Reading other apps' windows (needed to read the captions):
-      open System Settings > Privacy & Security > Device Control and Data
-      Access (called "Accessibility" on older macOS) and turn on Claude.
+   a. Reading other apps' windows (needed to read Meet and Live Captions):
+      macOS says "uv would like to control this computer using
+      accessibility features" (on some Macs another name, e.g. python3.13).
+      That name is Sidenote: Claude starts it with the tool "uv" since
+      Claude's November update, so allowing Claude is not enough any more.
+      Click Open System Settings and, in Privacy & Security > Device
+      Control and Data Access (called "Accessibility" on older macOS),
+      turn on exactly the name macOS asked about.
+      - Not sure which? Sidenote shows an orange line (on its New meeting
+        screen, or at the bottom during a meeting) with the exact name.
+        Click it: it opens that settings page. If the name is listed
+        twice, turn on both. Other entries (Claude, python3.14, ...) don't
+        count.
+      - It works right away. If Sidenote then says "Allowed · quit
+        Claude and open it again", do that once.
    b. "Claude would like to access files in your Documents folder":
       click Allow (meeting notes are saved in Documents/Sidenote).
 
-7. After turning on Claude in step 6a, quit Claude with Cmd+Q, open it
-   again, and type "open Sidenote" in a chat once more. The Sidenote window
-   appears next to your screen.
+7. The Sidenote window appears next to your screen. Text is larger on Mac
+   since v15 (the window keeps its size). Each open list (Transcript,
+   Actions, To ask, Context, Agenda) shows at least 5 lines; in a short
+   window Sidenote makes the window taller to fit them.
    The first time, Sidenote may ask at the top of its window: "What name
    should Sidenote use for you?". Check the name and click Save (it is
    used instead of "You" in the notes, and never asked again).
@@ -54,8 +67,10 @@ FIRST START
 TRY IT IN A GOOGLE MEET CALL
 
 8. Join a Google Meet call in Chrome (a call with a friend or colleague,
-   or a test call on your own). In the Sidenote window click "Start
-   meeting", then talk for a few minutes.
+   or a test call on your own) while the Sidenote window is open. NEW IN
+   v14: you don't need to click "Start meeting": within about 5 seconds
+   of opening the Meet call, Sidenote starts the meeting by itself and
+   turns on Meet's captions. Talk for a few minutes.
    - Don't turn on Meet's captions yourself: within about 10 seconds
      Sidenote turns them on by itself (Meet's "Captions and translation"
      button > "Turn on captions"), and the bottom line says "Google Meet
@@ -64,6 +79,9 @@ TRY IT IN A GOOGLE MEET CALL
      save the Meet window structure  and send me the file it saves
      (Documents/Sidenote/debug_meet_tree.txt). Then turn captions on
      yourself to continue.
+   - Keep the Meet tab in front while you test: macOS only lets Sidenote
+     read the tab on screen. If Meet is behind another tab, Sidenote says
+     so and listens through Live Captions until you bring Meet back.
    - Ask Claude something in the box at the bottom of the Sidenote window,
      for example "What should I ask now?". Your question and Claude's
      answer appear at the top; older ones are below (scroll down).
@@ -80,8 +98,11 @@ TRY IT IN A GOOGLE MEET CALL
 
 8b. Your microphone (in Zoom, Teams, or just a YouTube video):
    - Close the Google Meet tab, then type "open Sidenote" in a new Claude
-     chat. Sidenote uses macOS Live Captions for the other people and your
-     microphone for your own voice.
+     chat. Sidenote turns on macOS Live Captions by itself (System Settings
+     may flash for a moment) and uses it for the other people (the sound of
+     your Mac); your own voice comes from your microphone.
+   - Play a YouTube video or talk in a call: the video's words should appear
+     in the Transcript view, and so should what you say.
    - If macOS asks "Claude would like to access the microphone", click
      Allow. The first time, the bottom of the Sidenote window says
      "preparing mic" for a minute or two (one-time download).
@@ -137,7 +158,7 @@ CHECK THE VERSION
 
 9. In the Claude chat, ask:
        What's Sidenote's status?
-   The answer ends with "Version: 2026-11-17 v12". The Sidenote window title
+   The answer ends with "Version: 2026-11-17 v16". The Sidenote window title
    shows the same version.
 
 

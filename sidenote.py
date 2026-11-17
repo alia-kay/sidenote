@@ -1797,6 +1797,7 @@ class MacCaptionsWindow:
         self.note = ""
         self.started_by_us = False
         self.busy = False
+        self.restarted = False      # restarted a stuck Live Captions once already
 
     # -- helpers ----------------------------------------------------------------
     def _window(self):
@@ -1826,41 +1827,101 @@ class MacCaptionsWindow:
         except Exception as e:
             log.info("Could not move Live Captions: %s", e)
 
+    @staticmethod
+    def enabled():
+        """The Live Captions switch as macOS saved it (True/False), or None if
+        unknown. Reading needs no permission and doesn't open System Settings."""
+        try:
+            from CoreFoundation import CFPreferencesAppSynchronize, CFPreferencesCopyAppValue
+            CFPreferencesAppSynchronize(MAC_UA_DOMAIN)
+            value = CFPreferencesCopyAppValue(MAC_LC_PREF, MAC_UA_DOMAIN)
+            return None if value is None else bool(value)
+        except Exception:
+            return None
+
+    def _find_switch(self, win):
+        """The Live Captions on/off switch in a System Settings window, and how it
+        was recognised. macOS 27 no longer puts the old identifier on the switch
+        itself, so: identifier (on the switch or the row around it), then the
+        switch's own label, then the first switch of the page. Label and first
+        switch count only on the Live Captions page itself (window title, or the
+        heading / footer text only that page has): other pages, like Shortcut,
+        have a "Live Captions" checkbox that must never be pressed."""
+        texts = mac_strings(AX_SETTINGS_STRINGS, ("systemTranscription.toggle",
+                                                  "systemTranscription.apps.header",
+                                                  "systemTranscription.toggle.footer"))
+        toggle_names = texts["systemTranscription.toggle"] | {"live captions"}
+        markers = (texts["systemTranscription.apps.header"] |
+                   texts["systemTranscription.toggle.footer"] | {"in-app live captions"})
+        on_page = ax_text(win, "AXTitle") in toggle_names
+        by_label = first_switch = None
+        for el, _ in ax_walk(win, 80):
+            role = ax(el, "AXRole")
+            ident = str(ax(el, "AXIdentifier") or "")
+            if "SYSTEM_TRANSCRIPTION_ENABLED" in ident or ident == "systemTranscription.toggle":
+                if role == "AXCheckBox":
+                    return el, "identifier"
+                for inner, _ in ax_walk(el, 8):
+                    if ax(inner, "AXRole") == "AXCheckBox":
+                        return inner, "identifier (row)"
+            if role == "AXCheckBox":
+                if by_label is None and ax_label(el) in toggle_names:
+                    by_label = el
+                if first_switch is None and ax(el, "AXSubrole") == "AXSwitch":
+                    first_switch = el
+            elif ax_label(el) in markers or ax_text(el, "AXValue") in markers:
+                on_page = True
+        if on_page and by_label is not None:
+            return by_label, "label"
+        if on_page and first_switch is not None:
+            return first_switch, "first switch on the Live Captions page"
+        return None, ""
+
     def _set_enabled(self, on):
-        """Flip the Live Captions switch in System Settings, then close Settings."""
+        """Flip the Live Captions switch in System Settings, then close Settings.
+        Returns (switch found, switched by us). Does nothing when macOS already
+        has Live Captions in the wanted state."""
         import subprocess
         from AppKit import NSWorkspace
+        if self.enabled() is on:
+            return True, False
         def settings_apps():
             return [a for a in NSWorkspace.sharedWorkspace().runningApplications()
                     if str(a.bundleIdentifier() or "") == "com.apple.systempreferences"]
         was_open = bool(settings_apps())
         subprocess.run(["open", "-g", self.SETTINGS_URL])
-        switch = None
-        for _ in range(30):                               # up to ~6 s
+        switch, how = None, ""
+        for _ in range(30):                               # up to ~6 s and more
             time.sleep(0.2)
             for app in settings_apps():
                 el = AXUIElementCreateApplication(app.processIdentifier())
                 for w in ax(el, "AXWindows") or []:
-                    for x, _ in ax_walk(w, 45):
-                        if ax(x, "AXIdentifier") == self.SWITCH_ID:
-                            switch = x
-                            break
+                    switch, how = self._find_switch(w)
                     if switch is not None:
                         break
+                if switch is not None:
+                    break
             if switch is not None:
                 break
         changed = False
         if switch is not None:
-            value = ax(switch, "AXValue")
-            if bool(value) != on:
+            if bool(ax(switch, "AXValue")) != on:
                 try:
                     from ApplicationServices import AXUIElementPerformAction
                     AXUIElementPerformAction(switch, "AXPress")
                     changed = True
                 except Exception as e:
                     log.info("Could not press the Live Captions switch: %s", e)
+            for _ in range(10):                           # wait until macOS saved it
+                state = self.enabled()
+                if state is None or state == on:
+                    break
+                time.sleep(0.2)
+            log.info("Live Captions switch found (%s), now %s", how,
+                     {True: "on", False: "off", None: "unknown"}[self.enabled()])
         else:
             log.info("Live Captions switch not found in System Settings")
+            self._log_settings_switches(settings_apps())
         time.sleep(0.6)
         for app in settings_apps():                       # tidy up Settings
             try:
@@ -1870,17 +1931,53 @@ class MacCaptionsWindow:
                 pass
         return switch is not None, changed
 
+    @staticmethod
+    def _log_settings_switches(apps):
+        """For troubleshooting: the switches and headings Settings showed."""
+        lines = []
+        for app in apps:
+            el = AXUIElementCreateApplication(app.processIdentifier())
+            for w in ax(el, "AXWindows") or []:
+                lines.append(f"window {ax_text(w, 'AXTitle')!r}")
+                for x, d in ax_walk(w, 80):
+                    role = ax(x, "AXRole")
+                    if role in ("AXCheckBox", "AXHeading") or ax(x, "AXIdentifier"):
+                        lines.append(f"  {role}/{ax(x, 'AXSubrole')} id={ax_text(x, 'AXIdentifier')!r} "
+                                     f"label={ax_label(x)!r} value={ax(x, 'AXValue')!r}")
+                    if len(lines) > 40:
+                        break
+        log.info("System Settings controls: %s", " | ".join(lines) or "none")
+
     # -- the same interface as the Windows helper ------------------------------------
     def ensure_running(self):
-        if self.busy or self._window() is not None:
-            return
+        if self.busy or not mac_trusted() or self._window() is not None:
+            return          # (no permission yet: captions_loop calls again once allowed)
         def work():
             self.busy = True
             try:
+                was_on = self.enabled()
                 found, changed = self._set_enabled(True)
                 self.started_by_us = changed
-                if not found:
+                if was_on:
+                    # On in Settings but no window: Live Captions got stuck or its
+                    # window was closed. Switch it off and on again, once.
+                    for _ in range(15):
+                        if self._window() is not None:
+                            break
+                        time.sleep(0.2)
+                    if self._window() is None and not self.restarted:
+                        self.restarted = True
+                        log.info("Live Captions is on but has no window: restarting it")
+                        self._set_enabled(False)
+                        time.sleep(1.0)
+                        found, changed = self._set_enabled(True)
+                        self.started_by_us = changed
+                if was_on and self._window() is not None:
+                    log.info("Live Captions is already on")
+                elif not found or self.enabled() is False:
                     self.note = "Turn on Live Captions: Settings > Accessibility"
+                    ui_queue.put(("toast", "Couldn't turn on Live Captions: turn it on in "
+                                           "System Settings > Accessibility > Live Captions"))
                 else:
                     ui_queue.put(("toast", "Turned on Live Captions"))
             finally:
@@ -2153,13 +2250,61 @@ MEET_CC_LABELS = ("captions", "subtítulos", "subtitulos", "sous-titres",
                   "untertitel", "sottotitoli", "legendas", "субтитры")
 
 
+MEET_CODE = re.compile(r"\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b")
+
+
 def meet_key(title):
     """The meeting code from a Meet window title (abc-defg-hij), or the title."""
-    m = re.search(r"[a-z]{3}-[a-z]{4}-[a-z]{3}", (title or "").lower())
+    m = MEET_CODE.search((title or "").lower())
     return m.group(0) if m else (title or "").lower()
 
 
-SIDENOTE_VERSION = "2026-11-17 v12"
+def meet_code(title):
+    """The meeting code in a Meet title, or '' (Meet's home page has none)."""
+    m = MEET_CODE.search((title or "").lower())
+    return m.group(0) if m else ""
+
+
+MEET_CALLS_SEEN = set()     # Meet codes already recorded (or ended) this session
+
+
+class MeetCallWatcher:
+    """While the Sidenote window is open but not recording, notices a Google Meet
+    call (a Meet tab with a meeting code, in front or not) and starts the meeting
+    by itself; the Meet reader then turns on Meet's captions. Each call starts a
+    meeting once: ending it never makes it start again for the same call."""
+    EVERY = 5
+
+    def __init__(self):
+        self.checked = 0.0
+
+    def tick(self, meet):
+        now = time.time()
+        if now - self.checked < self.EVERY:
+            return
+        self.checked = now
+        try:
+            if IS_MAC and not ax_access_check():
+                return
+            key = meet.call_key()
+        except Exception as e:
+            log.info("Meet call check failed: %s", e)
+            return
+        if transcript.ended_at and getattr(self, "ended", None) != transcript.ended_at:
+            self.ended = transcript.ended_at     # the user just ended a meeting: the
+            if key:                              # call open now was part of it
+                MEET_CALLS_SEEN.add(key)
+            return
+        if not key or key in MEET_CALLS_SEEN:
+            return
+        MEET_CALLS_SEEN.add(key)
+        log.info("Google Meet call %s found: starting a meeting", key)
+        live.last_activity = now
+        ui_queue.put(("record", {}))
+        ui_queue.put(("toast", "Google Meet call found: meeting started, turning on captions"))
+
+
+SIDENOTE_VERSION = "2026-11-17 v16"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -2167,7 +2312,7 @@ class AutoCaptions:
     """Turns on Meet's captions (CC) for the user. At most two tries per
     meeting, a few seconds apart. Once captions have been on in a meeting it
     never presses again, so turning them off on purpose is respected."""
-    MAX_TRIES = 2
+    MAX_TRIES = 3
     RETRY_SECONDS = 6
 
     def __init__(self, app="Google Meet", short="Meet"):
@@ -2237,6 +2382,11 @@ class MeetReader:
     def reset(self):
         self.region = None
         self.window = None
+
+    def call_key(self):
+        """The code of a Google Meet call open in a browser window, or ''."""
+        win = self._find_meet_window()
+        return meet_code(win.Name) if win is not None else ""
 
     def _find_meet_window(self):
         for win in auto.GetRootControl().GetChildren():
@@ -2379,6 +2529,8 @@ class MeetReader:
                 if self.window is None:
                     self.status = "Google Meet not found"
                     return False
+                if meet_code(self.window.Name):
+                    MEET_CALLS_SEEN.add(meet_code(self.window.Name))
                 self.region = self._find_region(self.window)
                 if self.region is None:
                     self.status = "Google Meet open - turn on captions (CC button)"
@@ -2417,7 +2569,41 @@ if IS_MAC:
 
     MAC_LC_BUNDLE = "com.apple.accessibility.LiveTranscriptionAgent"
     MAC_BROWSERS = ("com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser",
-                    "company.thebrowser.Browser", "com.google.Chrome.canary")
+                    "company.thebrowser.Browser", "com.google.Chrome.canary",
+                    "company.thebrowser.dia", "com.vivaldi.Vivaldi",
+                    "com.operasoftware.Opera", "ai.perplexity.comet")
+    MEET_BROWSERS_MAC = MAC_BROWSERS + ("com.apple.Safari",)
+    MAC_UA_DOMAIN = "com.apple.universalaccess"     # where the Live Captions switch is saved
+    MAC_LC_PREF = "systemTranscriptionEnabled"
+    # Apple's own UI texts in every language, to recognise controls by label
+    AX_SETTINGS_STRINGS = ("/System/Library/ExtensionKit/Extensions/"
+                           "AccessibilitySettingsExtension.appex/Contents/Resources/"
+                           "Localizable.loctable")
+    LC_APP_STRINGS = ("/System/Library/PrivateFrameworks/AccessibilitySharedSupport.framework/"
+                      "Versions/A/Resources/Live Captions.app/Contents/Resources/"
+                      "Localizable.loctable")
+    _strings_cache = {}
+
+    def mac_strings(path, keys):
+        """{key: set of its texts in every language, lower case} from one of
+        Apple's .loctable files, so labels match whatever language the Mac uses.
+        Empty sets if the file can't be read (other macOS versions)."""
+        if path not in _strings_cache:
+            try:
+                import plistlib
+                with open(path, "rb") as f:
+                    _strings_cache[path] = plistlib.load(f)
+            except Exception as e:
+                log.info("Could not read %s: %s", os.path.basename(path), e)
+                _strings_cache[path] = {}
+        out = {k: set() for k in keys}
+        for table in _strings_cache[path].values():
+            if isinstance(table, dict):
+                for k in keys:
+                    v = table.get(k)
+                    if isinstance(v, str) and v.strip():
+                        out[k].add(v.replace("\xa0", " ").strip().lower())
+        return out
 
     def ax(el, name):
         try:
@@ -2425,6 +2611,15 @@ if IS_MAC:
             return val if err == 0 else None
         except Exception:
             return None
+
+    def ax_text(el, name):
+        """An attribute as plain lower-case text ('' if missing)."""
+        value = ax(el, name)
+        return str(value).replace("\xa0", " ").strip().lower() if isinstance(value, str) else ""
+
+    def ax_label(el):
+        """What an element is called: its title, else its description."""
+        return ax_text(el, "AXTitle") or ax_text(el, "AXDescription")
 
     def ax_walk(el, max_depth, depth=0):
         yield el, depth
@@ -2446,35 +2641,228 @@ if IS_MAC:
         except Exception:
             return False
 
+    AX_ACCESS = {"ok": None, "asked": False, "restart": False, "probed": 0.0}
+    AX_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+    def _responsible_exe():
+        """The program macOS checks Sidenote's permissions against. Claude starts
+        extensions through its 'disclaimer' helper, which makes the program it
+        starts answer for itself and for everything below it: that is uv when
+        Claude runs Sidenote with 'uv run' (or Python when started directly).
+        Without the helper (an older Claude), Claude itself answers."""
+        import subprocess
+
+        def ps(pid, field):
+            return subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        claude = None
+        try:
+            pid = os.getpid()
+            for _ in range(12):
+                ppid = int(ps(pid, "ppid") or 0)
+                if ppid <= 1:
+                    break
+                parent = ps(ppid, "comm")
+                if os.path.basename(parent) == "disclaimer":
+                    return ps(pid, "comm")
+                if claude is None and parent.endswith(".app/Contents/MacOS/Claude"):
+                    claude = parent
+                pid = ppid
+        except Exception as e:
+            log.info("Could not find the program macOS checks: %s", e)
+        return claude or os.path.realpath(sys.executable)
+
+    AX_APP_PATH = _responsible_exe()
+    AX_APP_NAME = os.path.basename(AX_APP_PATH)      # what macOS lists, e.g. uv or python3.13
+
+    def _ax_page_name():
+        """What this macOS calls the list where Sidenote must be switched on."""
+        try:
+            import platform
+            major = int((platform.mac_ver()[0] or "0").split(".")[0])
+        except Exception:
+            major = 0
+        return "Device Control and Data Access" if major >= 27 else "Accessibility"
+
+    AX_PAGE = "Privacy & Security > " + _ax_page_name()
+    AX_HELP = (f"Sidenote can't read Google Meet or Live Captions yet. Click here, then in "
+               f"{AX_PAGE} turn on \u201c{AX_APP_NAME}\u201d: macOS knows Sidenote by that "
+               f"name (Claude and other entries don't count). If {AX_APP_NAME} is listed "
+               f"twice, turn on both.")
+
+    def ax_access_check():
+        """May Sidenote read other apps' windows (Meet, Live Captions, Settings)?
+
+        Since Nov 2026 Claude starts extensions as processes of their own, so
+        Claude's permission no longer covers Sidenote: macOS sees Sidenote's
+        Python (python3.13). Asks macOS once; its dialog adds that Python to
+        Privacy & Security > Accessibility, where the user switches it on.
+        macOS applies the switch right away, no restart needed."""
+        ok = mac_trusted()
+        if not ok and not AX_ACCESS["asked"]:
+            AX_ACCESS["asked"] = True
+            log.info("Accessibility not allowed for %s (Sidenote runs below it): asking macOS",
+                     AX_APP_PATH)
+            mac_trusted(prompt=True)
+            ui_queue.put(("toast", f"macOS needs your OK: turn on {AX_APP_NAME} in {AX_PAGE}"))
+        if not ok and not AX_ACCESS["restart"] and time.time() - AX_ACCESS["probed"] >= 10:
+            # Allowed already, but macOS applies it only to a fresh process?
+            AX_ACCESS["probed"] = time.time()
+            if _ax_allowed_fresh():
+                AX_ACCESS["restart"] = True
+                log.info("Accessibility allowed for a new process: Claude must restart Sidenote")
+                ui_queue.put(("toast", "Allowed. Quit Claude (Cmd+Q) and open it again to finish"))
+        if ok and AX_ACCESS["ok"] is False:
+            log.info("Accessibility allowed now")
+        AX_ACCESS["ok"] = ok
+        return ok
+
+    def _ax_allowed_fresh():
+        """Asks a new copy of this Python (same identity for macOS) whether it may
+        read other apps' windows."""
+        import subprocess
+        try:
+            r = subprocess.run([sys.executable, "-I", "-c",
+                                "from ApplicationServices import AXIsProcessTrusted as t;"
+                                "print(int(bool(t())))"],
+                               capture_output=True, text=True, timeout=20)
+            return r.stdout.strip() == "1"
+        except Exception:
+            return False
+
 
 class MacLiveCaptionsReader:
     """macOS Live Captions: lines of text in a window, no speaker names."""
     name = LC_NAME
 
+    CHECK_EVERY = 30                # seconds between source/pause checks
+
     def __init__(self):
         self.region = None
+        self.window = None
         self.last_raw = None
+        self.checked_at = 0.0
+        self.dumped = False
+        self.warned = set()
         self.status = "Live Captions not found - " + LC_HINT
 
     def reset(self):
         self.region = None
+        self.window = None
         self.last_raw = None
+        self.checked_at = 0.0
+
+    @staticmethod
+    def _texts():
+        return mac_strings(LC_APP_STRINGS, (
+            "captions.list.label", "window.title", "audioSource.computer", "system.audio",
+            "audioSource.microphone", "microphone", "microphone.on", "paused",
+            "paused.titlebar", "menu.start"))
 
     def _find_region(self):
         apps = mac_apps((MAC_LC_BUNDLE,))
         if not apps:
             return None
+        texts = self._texts()
+        titles = texts["window.title"] | {"live captions"}
+        regions = texts["captions.list.label"] | {"captions"}
         app = AXUIElementCreateApplication(apps[0].processIdentifier())
         for win in ax(app, "AXWindows") or []:
             if ax(win, "AXIdentifier") == "AXLiveCaptionsWindow" or \
-                    str(ax(win, "AXTitle") or "") == "Live Captions":
+                    ax_text(win, "AXTitle") in titles:
                 for el, _ in ax_walk(win, 6):
-                    if str(ax(el, "AXDescription") or "") == "Captions":
+                    if ax_text(el, "AXDescription") in regions:
+                        self.window = win
                         return el
         return None
 
     def ensure_microphone(self, _win=None):
-        pass                        # macOS Live Captions has one source; nothing to switch
+        pass        # Mac: see ensure_computer_audio (the user's mic goes through Whisper)
+
+    def _warn_once(self, text):
+        if text not in self.warned:
+            self.warned.add(text)
+            ui_queue.put(("toast", text))
+
+    def _press(self, el):
+        from ApplicationServices import AXUIElementPerformAction
+        return AXUIElementPerformAction(el, "AXPress") == 0
+
+    def ensure_computer_audio(self):
+        """macOS Live Captions listens to ONE source: the computer's audio (the
+        other people in the call) or the microphone. Sidenote hears the user's
+        mic itself (Whisper), so Live Captions must stay on Computer Audio, and
+        not be paused. Only clear signs are acted on; everything is logged."""
+        if self.window is None:
+            return
+        t = self._texts()
+        mic_names = t["audioSource.microphone"] | t["microphone"] | {"microphone"}
+        computer_names = t["audioSource.computer"] | t["system.audio"] | {"computer audio"}
+        paused_names = t["paused"] | t["paused.titlebar"] | {"live captions paused", "paused"}
+        start_names = t["menu.start"] | {"start live captions"}
+        regions = t["captions.list.label"] | {"captions"}
+        popup = mic_box = start = None
+        paused = False
+        seen = []
+
+        def controls(el, depth=0):          # the window minus the caption text itself
+            yield el
+            if depth < 14:
+                for child in ax(el, "AXChildren") or []:
+                    if ax_text(child, "AXDescription") not in regions:
+                        yield from controls(child, depth + 1)
+
+        for el in controls(self.window):
+            role = ax(el, "AXRole")
+            label, value = ax_label(el), ax_text(el, "AXValue")
+            if label in paused_names or value in paused_names:
+                paused = True
+            if role in (None, "AXStaticText", "AXGroup", "AXScrollArea", "AXList",
+                        "AXLayoutArea", "AXImage"):
+                continue
+            if not self.dumped:
+                seen.append(f"{role}/{ax(el, 'AXSubrole')} label={label!r} "
+                            f"value={ax(el, 'AXValue')!r} id={ax_text(el, 'AXIdentifier')!r}")
+            if role == "AXPopUpButton" and (value in mic_names or label in mic_names):
+                popup = el
+            elif role == "AXCheckBox" and label in mic_names and ax(el, "AXValue") in (1, True):
+                mic_box = el
+            elif role == "AXButton" and label in start_names:
+                start = el
+        if not self.dumped:
+            self.dumped = True
+            log.info("Live Captions controls: %s", " | ".join(seen[:25]) or "none")
+        try:
+            if popup is not None:
+                self._press(popup)                       # opens the source menu
+                choice = None
+                for _ in range(10):
+                    time.sleep(0.2)
+                    for el, _ in ax_walk(popup, 4):
+                        if ax(el, "AXRole") == "AXMenuItem" and ax_label(el) in computer_names:
+                            choice = el
+                            break
+                    if choice is not None:
+                        break
+                if choice is not None:
+                    self._press(choice)
+                    log.info("Live Captions was on Microphone: switched to Computer Audio")
+                    ui_queue.put(("toast", "Live Captions now listens to the call audio"))
+                else:
+                    self._press(popup)                   # close the menu again
+                    log.info("Live Captions is on Microphone; Computer Audio not found in its menu")
+                    self._warn_once("Live Captions listens to your mic only: set it to "
+                                    "Computer Audio in its window")
+            elif mic_box is not None:
+                self._press(mic_box)
+                log.info("Live Captions microphone was on: switched it off (computer audio)")
+            if paused and start is not None:
+                self._press(start)
+                log.info("Live Captions was paused: started it")
+            elif paused:
+                log.info("Live Captions looks paused, no start button found")
+                self._warn_once("Live Captions is paused: press play in its window")
+        except Exception as e:
+            log.info("Could not check the Live Captions source: %s", e)
 
     def poll(self):
         try:
@@ -2487,6 +2875,10 @@ class MacLiveCaptionsReader:
                     self.status = "Live Captions not found - " + LC_HINT
                     return False
                 log.info("Connected to macOS Live Captions")
+                self.checked_at = 0.0
+            if time.time() - self.checked_at >= self.CHECK_EVERY:
+                self.checked_at = time.time()
+                self.ensure_computer_audio()
             parts = [str(ax(c, "AXValue") or "") for c in ax(self.region, "AXChildren") or []]
             raw = " ".join(p for p in parts if p.strip())
             if not raw:
@@ -2504,25 +2896,55 @@ class MacLiveCaptionsReader:
             return False
 
 
+MEET_REGION_ROLES = ("AXGroup", "AXList")
+
+
 class MacMeetReader:
-    """Google Meet captions in Chrome (or Edge, Brave, Arc) on macOS, with names."""
+    """Google Meet captions on macOS (Chrome, Edge, Brave, Arc, Dia, Safari, ...),
+    with speaker names.
+
+    macOS only shows the page of the tab in front, so a Meet tab behind another
+    tab can't be read: Sidenote says so (and uses Live Captions meanwhile)."""
     name = "Google Meet"
+    MISSING_SECONDS = 8         # captions area gone this long = captions lost
+    TAB_CHECK_SECONDS = 20      # look for a Meet tab in the background this often
+    HINT_EVERY = 120            # ...and say so at most this often
+    BEHIND = "Google Meet is in a background tab"
 
     def __init__(self):
         self.region = None
+        self.window = None
         self.last_search = 0.0
+        self.region_seen = 0.0
+        self.tabs_checked = 0.0
+        self.hint_at = 0.0
         self.status = "Google Meet not found"
+        self.logged = ""
+        self.dumped = set()
         self._asked = set()
         self.auto = AutoCaptions()
         self.key = ""
 
     def reset(self):
         self.region = None
+        self.window = None
+
+    def _note(self, status):
+        """Set the status; log it when it changes (for troubleshooting)."""
+        self.status = status
+        if status != self.logged:
+            self.logged = status
+            log.info("Meet: %s", status)
+
+    @staticmethod
+    def _is_meet(title):
+        t = (title or "").strip().lower()
+        return bool(re.match(r"meet\b", t)) or "google meet" in t or "meet.google.com" in t
 
     @staticmethod
     def _cc_kind(el):
-        """'box': Meet's captions toggle, now off. 'button': a "Turn on
-        captions" button. None: anything else."""
+        """'box': Meet's captions toggle, now off. 'on': the same toggle, on.
+        'button': a "Turn on captions" button. None: anything else."""
         role = ax(el, "AXRole")
         if role not in ("AXCheckBox", "AXButton", "AXPopUpButton", "AXMenuButton"):
             return None
@@ -2531,14 +2953,22 @@ class MacMeetReader:
         if not any(w in label for w in MEET_CC_LABELS):
             return None
         if role == "AXCheckBox":
-            return "box" if str(ax(el, "AXValue")) in ("0", "False") else None
+            value = str(ax(el, "AXValue"))
+            if value in ("0", "False"):
+                return "box"
+            if value in ("1", "True"):
+                return "on"
+            # no on/off value: Meet's 'Captions and translation' button (Nov 2026),
+            # which only opens the menu; handled below like a menu button
         if label.startswith("turn on"):
             return "button"
+        if label.startswith("turn off") and role == "AXButton":
+            return "on"                     # 'Turn off captions' in Meet's menu
         # Meet since Nov 2026: 'Captions and translation' opens a menu that holds
         # 'Turn on captions' (a pop-up button, or a button with AXExpanded)
         if not label.startswith(("turn off", "hide")):
             expanded = ax(el, "AXExpanded")
-            if role in ("AXPopUpButton", "AXMenuButton") or expanded is not None:
+            if role in ("AXPopUpButton", "AXMenuButton", "AXCheckBox") or expanded is not None:
                 if str(expanded) not in ("1", "True"):
                     return "box"
         return None
@@ -2573,12 +3003,20 @@ class MacMeetReader:
                 how += "button"
             else:
                 how += "no button"
+                # A menu we opened stays open over the call: close it again.
+                # Only a menu button that says it is expanded; pressing a plain
+                # CC toggle twice would turn captions off again.
+                if how.startswith("menu") and str(ax(cc_box, "AXExpanded")) in ("1", "True"):
+                    AXUIElementPerformAction(cc_box, "AXPress")
+                    how += ", menu closed"
         except Exception as e:
             log.info("Could not press Meet captions: %s", e)
         self.auto.pressed(self.key, attempt, how, ok)
 
-    def _find_region(self):
-        for app in mac_apps(MAC_BROWSERS):
+    def _windows(self):
+        """(window, title) for every window of the browsers Sidenote knows."""
+        out = []
+        for app in mac_apps(MEET_BROWSERS_MAC):
             pid = app.processIdentifier()
             el_app = AXUIElementCreateApplication(pid)
             if pid not in self._asked:          # ask the browser to expose page content
@@ -2589,27 +3027,117 @@ class MacMeetReader:
                     except Exception:
                         pass
             for win in ax(el_app, "AXWindows") or []:
-                title = str(ax(win, "AXTitle") or "").lower()
-                if not (title.startswith("meet") or "google meet" in title):
-                    continue
-                self.key = meet_key(title)
-                cc_box = cc_btn = None
-                for el, _ in ax_walk(win, 60):
-                    note_meet_label(str(ax(el, "AXTitle") or "") or
-                                    str(ax(el, "AXDescription") or ""))
-                    if ax(el, "AXRole") == "AXGroup" and (
-                            str(ax(el, "AXTitle") or "") == "Captions" or
-                            str(ax(el, "AXDescription") or "") == "Captions"):
-                        if ax(el, "AXChildren"):
-                            return el
-                    kind = self._cc_kind(el)
-                    if kind == "box" and cc_box is None:
-                        cc_box = el
-                    elif kind == "button" and cc_btn is None:
-                        cc_btn = el
-                self.status = "Google Meet open - turn on captions (CC button)"
+                out.append((win, str(ax(win, "AXTitle") or "")))
+        return out
+
+    def _scan(self, win):
+        """(captions area, CC toggle if off, Turn-on button, captions on?) in a
+        Meet window. An empty captions area counts only while CC is on."""
+        empty = cc_box = cc_btn = None
+        cc_on = False
+        for el, _ in ax_walk(win, 60):
+            role = ax(el, "AXRole")
+            note_meet_label(str(ax(el, "AXTitle") or "") or str(ax(el, "AXDescription") or ""))
+            if role in MEET_REGION_ROLES and (ax_text(el, "AXTitle") in MEET_CC_LABELS or
+                                              ax_text(el, "AXDescription") in MEET_CC_LABELS):
+                if ax(el, "AXChildren"):
+                    return el, None, None, True
+                empty = empty or el
+                continue
+            kind = self._cc_kind(el)
+            if kind == "box" and cc_box is None:
+                cc_box = el
+            elif kind == "button" and cc_btn is None:
+                cc_btn = el
+            elif kind == "on":
+                cc_on = True
+        return (empty if cc_on else None), cc_box, cc_btn, cc_on
+
+    def _dump_caption_labels(self, win):
+        """Once per meeting, log what Meet shows about captions (troubleshooting)."""
+        if self.key in self.dumped:
+            return
+        self.dumped.add(self.key)
+        seen = []
+        for el, _ in ax_walk(win, 60):
+            label = ax_label(el)
+            if any(w in label for w in MEET_CC_LABELS):
+                seen.append(f"{ax(el, 'AXRole')}/{ax(el, 'AXSubrole')} {label!r} "
+                            f"value={ax(el, 'AXValue')!r} children={len(ax(el, 'AXChildren') or [])}")
+            if len(seen) >= 15:
+                break
+        log.info("Meet caption elements: %s", " | ".join(seen) or "none")
+
+    @staticmethod
+    def _tab_titles(windows):
+        """The titles of all browser tabs (from the tab strips, not the pages)."""
+        def tabs(el, depth=0):
+            yield el
+            if depth < 12:
+                for child in ax(el, "AXChildren") or []:
+                    if ax(child, "AXRole") != "AXWebArea":
+                        yield from tabs(child, depth + 1)
+        for win, _ in windows:
+            for el in tabs(win):
+                if ax(el, "AXRole") in ("AXRadioButton", "AXTab"):
+                    yield ax_label(el)
+
+    def _meet_tab_behind(self, windows):
+        """True if a browser has a Meet tab that is not the tab in front."""
+        return any(self._is_meet(t) for t in self._tab_titles(windows))
+
+    def call_key(self):
+        """The code of a Google Meet call open in a browser, in front or in a
+        background tab, or '' (Meet's home page has no code)."""
+        windows = self._windows()
+        for _win, title in windows:
+            if self._is_meet(title) and meet_code(title):
+                return meet_code(title)
+        for title in self._tab_titles(windows):
+            if self._is_meet(title) and meet_code(title):
+                return meet_code(title)
+        return ""
+
+    def _connect(self, now):
+        windows = self._windows()
+        meet = [(w, t) for w, t in windows if self._is_meet(t)]
+        if not meet:
+            if now - self.tabs_checked >= self.TAB_CHECK_SECONDS:
+                self.tabs_checked = now
+                if windows and self._meet_tab_behind(windows):
+                    self._note(self.BEHIND)
+                    if now - self.hint_at >= self.HINT_EVERY:
+                        self.hint_at = now
+                        ui_queue.put(("toast", "Google Meet is in a background tab: bring it "
+                                               "to the front so Sidenote can read its captions"))
+                else:
+                    self._note("Google Meet not found")
+            elif self.status != self.BEHIND:
+                self._note("Google Meet not found")
+            return False
+        for win, title in meet:
+            self.key = meet_key(title)
+            if meet_code(title):
+                MEET_CALLS_SEEN.add(meet_code(title))     # this call is being recorded
+            region, cc_box, cc_btn, cc_on = self._scan(win)
+            if region is not None:
+                self.region, self.window, self.region_seen = region, win, now
+                log.info("Connected to Google Meet captions (macOS)")
+                self.auto.captions_on(self.key)
+                if transcript.count_lines():
+                    transcript.skip_visible = True
+                return True
+            if cc_on:
+                self._note("Google Meet captions on, but the captions area wasn't found")
+                self._dump_caption_labels(win)
+            elif cc_box is None and cc_btn is None:
+                self._note("Google Meet open - no CC button (not in a call yet?)")
+            else:
+                self._note("Google Meet open - turn on captions (CC button)")
                 self._auto_turn_on_captions(win, cc_box, cc_btn)
-        return None
+                if self.auto.attempt(self.key) is None and self.key not in self.auto.seen_on:
+                    self._dump_caption_labels(win)
+        return False
 
     def _blocks(self):
         blocks = []
@@ -2631,21 +3159,30 @@ class MacMeetReader:
     def poll(self):
         now = time.time()
         try:
-            if self.region is None or ax(self.region, "AXRole") is None:
-                self.region = None
-                if now - self.last_search < 4:
-                    return False
-                self.last_search = now
-                self.status = "Google Meet not found"
-                self.region = self._find_region()
-                if self.region is None:
-                    return False
-                log.info("Connected to Google Meet captions (macOS)")
-                self.auto.captions_on(self.key)
-                if transcript.count_lines():
-                    transcript.skip_visible = True
+            if self.region is not None and ax(self.region, "AXRole") is None:
+                self.region = None          # Meet redrew its captions area
+            if self.region is None:
+                alive = self.window is not None and ax(self.window, "AXRole") is not None
+                if alive and now - self.region_seen < self.MISSING_SECONDS:
+                    # Connected a moment ago: look again in the same window and
+                    # stay connected meanwhile (Meet redraws captions in pauses).
+                    if now - self.last_search >= 1.5:
+                        self.last_search = now
+                        self.region = self._scan(self.window)[0]
+                    if self.region is None:
+                        return True
+                else:
+                    if self.window is not None:
+                        log.info("Lost Google Meet captions (macOS)")
+                        self.window = None
+                    if now - self.last_search < 4:
+                        return False
+                    self.last_search = now
+                    if not self._connect(now):
+                        return False
             transcript.ingest_blocks(self._blocks())
-            self.status = "Google Meet captions connected"
+            self.region_seen = now
+            self._note("Google Meet captions connected")
             return True
         except Exception as e:
             log.info("Lost Google Meet captions: %s", e)
@@ -3425,6 +3962,8 @@ class MicTranscriber:
     MODEL = "base"            # multilingual, ~145 MB, downloaded once
     RATE = 16000
     SILENT_SECONDS = 4        # this long of exact zeros = macOS gives us silence
+    PARTIAL_EVERY = 1.5       # while talking, show the words so far this often (s of speech)
+    MAX_PHRASE = 8            # save a phrase after this long even without a pause (was 12)
     LOCK_LANGUAGE_PROB = 0.8  # detected this surely -> keep that language
 
     def __init__(self):
@@ -3497,7 +4036,7 @@ class MicTranscriber:
             self.model = WhisperModel(self.MODEL, device="cpu", compute_type="int8")
         return self.model
 
-    def _transcribe(self, audio):
+    def _transcribe(self, audio, partial=False):
         segments, info = self._load().transcribe(
             audio, language=self.language, beam_size=1, vad_filter=False,
             condition_on_previous_text=False)
@@ -3509,7 +4048,7 @@ class MicTranscriber:
         text = " ".join(w for w in words if w)
         # Auto-detect the language, then keep it once Whisper is sure: short
         # phrases are often mis-detected on their own.
-        if self.language is None and text and \
+        if self.language is None and text and not partial and \
                 getattr(info, "language_probability", 0) >= self.LOCK_LANGUAGE_PROB:
             self.language = info.language
             log.info("Microphone language: %s", self.language)
@@ -3547,6 +4086,7 @@ class MicTranscriber:
         peak, peak_t, started = 0.0, time.time(), time.time()
         any_signal = False
         noise, speech, silence, heard = 0.004, [], 0.0, 0.0
+        partial_at = 0.0          # seconds of speech when the words were last shown
         try:
             while self.running.is_set():
                 try:
@@ -3573,10 +4113,23 @@ class MicTranscriber:
                     noise = 0.95 * noise + 0.05 * level          # follow the room noise
                 if talking:
                     speech.append(block); silence = 0.0; heard += 0.1
-                    transcript.pending = "You: …"
+                    if not transcript.pending.startswith("You: "):
+                        transcript.pending = "You: …"
                 elif speech:
                     speech.append(block); silence += 0.1
-                long_enough = len(speech) * 0.1 >= 12
+                spoken = len(speech) * 0.1
+                long_enough = spoken >= self.MAX_PHRASE
+                if speech and not (silence >= 0.8 or long_enough) and heard >= 0.6 and \
+                        spoken - partial_at >= self.PARTIAL_EVERY and blocks.qsize() < 5:
+                    # still talking: show the words so far in the hearing line
+                    # (skipped when the mic queue is behind, so it catches up)
+                    partial_at = spoken
+                    try:
+                        text = self._transcribe(np.concatenate(speech)[:, 0], partial=True)
+                        if text and speech:
+                            transcript.pending = f"You: {text} …"
+                    except Exception as e:
+                        log.info("Transcription error (live words): %s", e)
                 if speech and (silence >= 0.8 or long_enough):
                     if heard >= 0.4:
                         audio = np.concatenate(speech)[:, 0]
@@ -3586,8 +4139,8 @@ class MicTranscriber:
                                 transcript.add_spoken("You", text)
                         except Exception as e:
                             log.info("Transcription error: %s", e)
-                    speech, silence, heard = [], 0.0, 0.0
-                    if transcript.pending == "You: …":
+                    speech, silence, heard, partial_at = [], 0.0, 0.0, 0.0
+                    if transcript.pending.startswith("You: "):
                         transcript.pending = ""
         finally:
             try:
@@ -3644,9 +4197,12 @@ def captions_loop():
         windows = MacLiveCaptionsReader() if IS_MAC else LiveCaptionsReader()
         active = None              # reader currently feeding the transcript
         lost_since = None
+        watcher = MeetCallWatcher()
         while True:
             if IS_MAC and MAC_MIC_ENABLED:
                 update_mic(active is not None and active not in named)
+            if window_open.is_set() and (live.mode != "record" or transcript.ended_at):
+                watcher.tick(meet)          # a Meet call opened: start the meeting
             if not window_open.is_set() or live.mode != "record":
                 for reader in named:
                     reader.reset()
@@ -3658,6 +4214,15 @@ def captions_loop():
                 transcript.source = ""
                 time.sleep(POLL_SECONDS)
                 continue
+
+            if IS_MAC and not AX_ACCESS["ok"]:
+                if not ax_access_check():
+                    active = windows                 # keeps the user's mic recording
+                    transcript.status = "Needs Accessibility permission"
+                    transcript.source = ""
+                    time.sleep(1.0)
+                    continue
+                captions_win.ensure_running()        # allowed just now: start Live Captions
 
             if active in named:
                 if active.poll():
@@ -3893,8 +4458,7 @@ def debug_dump_call_app(path, app):
 def debug_dump_meet(path):
     """Write the UI tree of the Meet window to a file (for troubleshooting)."""
     if IS_MAC:
-        return _mac_dump(path, MAC_BROWSERS,
-                         lambda t: t.startswith("meet") or "google meet" in t)
+        return _mac_dump(path, MEET_BROWSERS_MAC, MacMeetReader._is_meet)
     lines = []
     with auto.UIAutomationInitializerInThread():
         reader = MeetReader()
@@ -5365,7 +5929,16 @@ END_RED = "#8e2b2b"     # End meeting (dark red)
 END_RED_HI = "#a83434"
 FIELD = SURFACE
 FONT = "Helvetica Neue" if IS_MAC else "Segoe UI"
-MAC_UI_SCALE = 1.45      # text size multiplier on macOS
+MAC_UI_SCALE = 1.45      # layout (spacing, window) scale on macOS; Tk ignores it for fonts
+MAC_FONT_SCALE = 1.5     # text size on macOS: Tk draws a 9 pt font as 9 px there
+
+
+def fs(size):
+    """A font size for Tk: larger on Mac (Tk draws points as pixels there, so
+    text came out tiny), unchanged on Windows."""
+    if IS_MAC and isinstance(size, (int, float)) and size > 0:
+        return int(round(size * MAC_FONT_SCALE))
+    return size
 
 
 ICON_256 = "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"
@@ -5426,7 +5999,7 @@ class Tooltip:
         self.win.wm_overrideredirect(True)
         self.win.attributes("-topmost", True)
         self.win.geometry(f"+{x}+{y}")
-        tk.Label(self.win, text=self.text, bg=SURFACE_HI, fg=FG, font=(FONT, 8),
+        tk.Label(self.win, text=self.text, bg=SURFACE_HI, fg=FG, font=(FONT, fs(8)),
                  padx=8, pady=3).pack()
 
     def _hide(self, _e=None):
@@ -5447,7 +6020,7 @@ class Pill(tk.Canvas):
         super().__init__(parent, height=height, width=10, bg=parent_bg,
                          highlightthickness=0, bd=0)
         import tkinter.font as tkfont
-        self.font = tkfont.Font(family=FONT, size=size)
+        self.font = tkfont.Font(family=FONT, size=fs(size))
         self.h, self.state_ = height, None
         self.pill_bg = bg
         self.command = command
@@ -5544,7 +6117,7 @@ class IconTab(tk.Canvas):
             self.create_line(cx, cy, cx + 3.5 * k, cy + 2 * k, fill=c, width=lw * 0.85,
                              capstyle="round")
         if self.badge:                                     # a meeting is recording
-            self.create_text(w - px(9), px(8), text="●", fill=ACCENT, font=(FONT, 6))
+            self.create_text(w - px(9), px(8), text="●", fill=ACCENT, font=(FONT, fs(6)))
 
 
 class InputPill(tk.Canvas):
@@ -5588,7 +6161,7 @@ class InputPill(tk.Canvas):
                          fill=ACCENT if self.enabled else SURFACE_HI, outline="",
                          tags=("shape", "send"))
         self.create_text(cx, cy, text="↑", fill="#ffffff" if self.enabled else FAINT,
-                         font=(FONT, 11, "bold"), tags=("shape", "send"))
+                         font=(FONT, fs(11), "bold"), tags=("shape", "send"))
         self.tag_bind("send", "<Button-1>", lambda e: self._send())
         self.tag_bind("send", "<Enter>",
                       lambda e: self.configure(cursor="hand2" if self.enabled else ""))
@@ -5629,7 +6202,7 @@ class Overlay:
         self.toast_text = ""
         self.root = tk.Tk()
         if IS_MAC:
-            # macOS draws a 9 pt Tk font as 9 px; scale up to normal Mac text sizes
+            # spacing and window sizes (px) follow this; text size is fs()
             self.root.tk.call("tk", "scaling", MAC_UI_SCALE)
         try:
             UI_SCALE[0] = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
@@ -5674,7 +6247,7 @@ class Overlay:
         header.pack(fill="x", padx=pad, pady=(px(12), 0))
         end_border = tk.Frame(header, bg=LINE, padx=1, pady=1)    # (moved to the tab row)
         self.end_btn = tk.Label(end_border, text="End meeting", bg=BG, fg=MUTED, cursor="hand2",
-                                font=(FONT, 9), padx=10, pady=3)
+                                font=(FONT, fs(9)), padx=10, pady=3)
         self.end_btn.pack()
         self.end_btn.bind("<Button-1>", self._end_btn_click)
         self._hover(self.end_btn, BG, SURFACE, fg_on=FG, fg_off=MUTED)
@@ -5682,11 +6255,11 @@ class Overlay:
         titles = tk.Frame(header, bg=BG)
         titles.pack(side="left", fill="x", expand=True)
         self.title_label = tk.Label(titles, text="", bg=BG, fg=FG, anchor="w",
-                                    justify="left", font=(SERIF, 18))
+                                    justify="left", font=(SERIF, fs(18)))
         self.title_label.pack(fill="x")
         self.title_label.bind("<Button-1>", lambda e: self._edit_info_from_click())
         self.info_label = tk.Label(titles, text="", bg=BG, fg=MUTED, anchor="w",
-                                   justify="left", font=(FONT, 9))
+                                   justify="left", font=(FONT, fs(9)))
         self.info_label.bind("<Button-1>", lambda e: self._edit_info_from_click())
         pills = tk.Frame(titles, bg=BG)            # ● 12 min · 3 people · captions source
         pills.pack(fill="x", pady=(px(12), 0))
@@ -5711,9 +6284,9 @@ class Overlay:
             chip = tk.Frame(chip_border, bg=BG, cursor="hand2", padx=8, pady=3)
             chip.pack()
             box = tk.Label(chip, text="", bg=BG)          # (no checkbox glyph any more)
-            name = tk.Label(chip, text=label, bg=BG, fg=MUTED, font=(FONT, 9), cursor="hand2")
+            name = tk.Label(chip, text=label, bg=BG, fg=MUTED, font=(FONT, fs(9)), cursor="hand2")
             name.pack(side="left")
-            badge = tk.Label(chip, text="", bg=SURFACE_HI, fg=FG, font=(FONT, 7, "bold"),
+            badge = tk.Label(chip, text="", bg=SURFACE_HI, fg=FG, font=(FONT, fs(7), "bold"),
                              padx=5, pady=0, cursor="hand2")
             parts = (chip, box, name, badge)
             for part in parts:
@@ -5729,20 +6302,20 @@ class Overlay:
         # ---- name question: asked once, inline (no popup, never takes focus) --
         self.name_bar = tk.Frame(self.rec, bg=SURFACE, padx=10, pady=6)
         tk.Label(self.name_bar, text="What name should Sidenote use for you?", bg=SURFACE,
-                 fg=FG, font=(FONT, 9), anchor="w").pack(fill="x")
+                 fg=FG, font=(FONT, fs(9)), anchor="w").pack(fill="x")
         row = tk.Frame(self.name_bar, bg=SURFACE)
         row.pack(fill="x", pady=(4, 0))
-        close = tk.Label(row, text="✕", bg=SURFACE, fg=MUTED, font=(FONT, 9),
+        close = tk.Label(row, text="✕", bg=SURFACE, fg=MUTED, font=(FONT, fs(9)),
                          cursor="hand2", padx=4)
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: self._name_later())
-        save = tk.Label(row, text="Save", bg=ACCENT, fg="#ffffff", font=(FONT, 9, "bold"),
+        save = tk.Label(row, text="Save", bg=ACCENT, fg="#ffffff", font=(FONT, fs(9), "bold"),
                         padx=10, pady=2, cursor="hand2")
         save.pack(side="right", padx=(6, 4))
         save.bind("<Button-1>", lambda e: self._name_save())
         self._hover(save, ACCENT, ACCENT_HI)
         self.name_entry = tk.Entry(row, bg=BG, fg=FG, insertbackground=FG, relief="flat",
-                                   font=(FONT, 10), borderwidth=0, highlightthickness=1,
+                                   font=(FONT, fs(10)), borderwidth=0, highlightthickness=1,
                                    highlightbackground=LINE, highlightcolor=ACCENT)
         self.name_entry.pack(side="left", fill="x", expand=True, ipady=3)
         self.name_entry.insert(0, os_full_name())          # pre-filled guess
@@ -5752,22 +6325,22 @@ class Overlay:
         # ---- footer (packed before the body so it always stays visible) -----
         footer = tk.Frame(self.root, bg=BG)
         footer.pack(side="bottom", fill="x", padx=pad, pady=(6, 10))
-        self.state_dot = tk.Label(footer, text="●", bg=BG, fg=FAINT, font=(FONT, 8))
+        self.state_dot = tk.Label(footer, text="●", bg=BG, fg=FAINT, font=(FONT, fs(8)))
         self.state_dot.pack(side="left")
-        self.state_label = tk.Label(footer, text="", bg=BG, fg=MUTED, font=(FONT, 8), anchor="w")
+        self.state_label = tk.Label(footer, text="", bg=BG, fg=MUTED, font=(FONT, fs(8)), anchor="w")
         self.state_label.pack(side="left", padx=(4, 0))
-        self.right_label = tk.Label(footer, text="", bg=BG, fg=FAINT, font=(FONT, 8), anchor="e")
+        self.right_label = tk.Label(footer, text="", bg=BG, fg=FAINT, font=(FONT, fs(8)), anchor="e")
         self.right_label.pack(side="right")
         self.right_label.bind("<Button-1>", lambda e: self._footer_click())
         self.footer = footer
-        self.caption_dot = tk.Label(footer, text="●", bg=BG, fg=FAINT, font=(FONT, 8))
+        self.caption_dot = tk.Label(footer, text="●", bg=BG, fg=FAINT, font=(FONT, fs(8)))
 
         # ---- input ----------------------------------------------------------
         self.input_pill = InputPill(self.rec, self.send)
         self.input_pill.pack(side="bottom", fill="x", padx=pad, pady=(4, 0))
         # Grows from 1 to 4 lines as you type, then scrolls (Shift+Enter = new line)
         self.entry = tk.Text(self.input_pill, bg=SURFACE, fg=FG, insertbackground=FG,
-                             relief="flat", font=(FONT, 10), borderwidth=0,
+                             relief="flat", font=(FONT, fs(10)), borderwidth=0,
                              highlightthickness=0, height=1, wrap="word",
                              padx=0, pady=2, undo=True)
         self.input_pill.hold(self.entry)
@@ -5785,7 +6358,7 @@ class Overlay:
         # Looks like an autosuggestion: faint italic text with a sparkle, no box
         self.missed_btn = tk.Label(self.suggest_row, text="\u2726  " + self.MISSED_PROMPT,
                                    bg=BG, fg=FAINT, cursor="hand2",
-                                   font=(FONT, 9, "italic"), padx=4, pady=2)
+                                   font=(FONT, fs(9), "italic"), padx=4, pady=2)
         self.missed_btn.pack(side="left")
         self.missed_btn.bind("<Button-1>", self.what_did_i_miss)
         self._hover(self.missed_btn, BG, BG, fg_on=FG, fg_off=FAINT)
@@ -5793,7 +6366,7 @@ class Overlay:
                         add=False)
 
         # ---- hearing line -----------------------------------------------------
-        self.tail = tk.Label(self.rec, text="", bg=BG, fg=FAINT, font=(FONT, 8, "italic"),
+        self.tail = tk.Label(self.rec, text="", bg=BG, fg=FAINT, font=(FONT, fs(8), "italic"),
                              justify="left", anchor="w", wraplength=w - 2 * pad)
         self.tail.pack(side="bottom", fill="x", padx=pad, pady=(8, 0))
 
@@ -5811,14 +6384,14 @@ class Overlay:
             frame = tk.Frame(self.paned, bg=BG)
             head = tk.Frame(frame, bg=BG)
             head.pack(fill="x", pady=(px(10), 0))
-            tk.Label(head, text=title, bg=BG, fg=FG, font=(FONT, 9, "bold"),
+            tk.Label(head, text=title, bg=BG, fg=FG, font=(FONT, fs(9), "bold"),
                      anchor="w").pack(side="left")
-            count = tk.Label(head, text="", bg=BG, fg=FAINT, font=(FONT, 8), anchor="w")
+            count = tk.Label(head, text="", bg=BG, fg=FAINT, font=(FONT, fs(8)), anchor="w")
             count.pack(side="left", padx=(8, 0))
             self.panel_count[key] = count
             tk.Frame(frame, bg=LINE, height=1).pack(fill="x", pady=(px(7), px(4)))
             text = tk.Text(frame, wrap="word", bg=BG, fg=FG, relief="flat",
-                           font=(FONT, 9), padx=px(4), pady=px(4), borderwidth=0,
+                           font=(FONT, fs(9)), padx=px(4), pady=px(4), borderwidth=0,
                            highlightthickness=0, spacing1=px(4), spacing3=px(4),
                            cursor="arrow", height=3, selectbackground=SURFACE_HI)
             text.pack(fill="both", expand=True)
@@ -5827,11 +6400,11 @@ class Overlay:
             text.tag_configure("done", foreground=FAINT, overstrike=True)
             text.tag_configure("box", foreground=MUTED)
             text.tag_configure("check", foreground=OK)
-            text.tag_configure("meta", foreground=FAINT, font=(FONT, 8))
-            text.tag_configure("speaker", foreground=MUTED, font=(FONT, 9, "bold"))
-            text.tag_configure("time", foreground=FAINT, font=(FONT, 8))
+            text.tag_configure("meta", foreground=FAINT, font=(FONT, fs(8)))
+            text.tag_configure("speaker", foreground=MUTED, font=(FONT, fs(9), "bold"))
+            text.tag_configure("time", foreground=FAINT, font=(FONT, fs(8)))
             text.tag_configure("note", foreground=ACCENT_HI)
-            text.tag_configure("ask_owner", foreground=WARN, font=(FONT, 8, "bold"))
+            text.tag_configure("ask_owner", foreground=WARN, font=(FONT, fs(8), "bold"))
             text.tag_configure("hover", background=SURFACE)
             text.configure(state="disabled")
             self.panels[key] = frame
@@ -5847,23 +6420,23 @@ class Overlay:
         # The conversation, like in Claude: your message, then Claude's reply.
         # Newest exchange on top; scroll down for the earlier ones.
         self.answer = tk.Text(card, wrap="word", bg=BG, fg=FG, relief="flat",
-                              font=(FONT, 10), padx=4, pady=10, borderwidth=0,
+                              font=(FONT, fs(10)), padx=4, pady=10, borderwidth=0,
                               highlightthickness=0, spacing2=2, spacing3=5, cursor="arrow",
                               height=3)
         self.answer.pack(side="left", fill="both", expand=True)
-        self.answer.tag_configure("hint", foreground=FAINT, font=(FONT, 9))
+        self.answer.tag_configure("hint", foreground=FAINT, font=(FONT, fs(9)))
         self.answer.tag_configure("muted", foreground=MUTED)
-        self.answer.tag_configure("you_name", foreground=MUTED, font=(FONT, 8, "bold"),
+        self.answer.tag_configure("you_name", foreground=MUTED, font=(FONT, fs(8), "bold"),
                                   spacing3=2)
-        self.answer.tag_configure("claude_name", foreground=ACCENT, font=(FONT, 8, "bold"),
+        self.answer.tag_configure("claude_name", foreground=ACCENT, font=(FONT, fs(8), "bold"),
                                   spacing1=6, spacing3=2)
-        self.answer.tag_configure("time", foreground=FAINT, font=(FONT, 8))
+        self.answer.tag_configure("time", foreground=FAINT, font=(FONT, fs(8)))
         self.answer.tag_configure("you", foreground=FG, background=SURFACE,
                                   lmargin1=0, lmargin2=0)
         self.answer.tag_configure("claude", foreground=FG)
-        self.answer.tag_configure("divider", foreground=LINE, font=(FONT, 6),
+        self.answer.tag_configure("divider", foreground=LINE, font=(FONT, fs(6)),
                                   spacing1=6, spacing3=6)
-        self.answer.tag_configure("notice_name", foreground=MUTED, font=(FONT, 8, "bold"),
+        self.answer.tag_configure("notice_name", foreground=MUTED, font=(FONT, fs(8), "bold"),
                                   spacing3=2)
         self.answer.tag_configure("notice", foreground=MUTED)
         self._notice = None            # status shown above the conversation (or None)
@@ -5892,6 +6465,13 @@ class Overlay:
                 g = json.load(f)
             w, h, x, y = int(g["w"]), int(g["h"]), int(g["x"]), int(g["y"])
             wm = g.get("w_meetings")
+            if IS_MAC:
+                # saved with another layout scale (v14 had 1.8): back to this one
+                ratio = MAC_UI_SCALE / float(g.get("layout_scale") or g.get("text_scale") or 1.45)
+                if abs(ratio - 1) > 0.01:
+                    w = min(int(w * ratio), sw)
+                    wm = min(int(int(wm) * ratio), sw) if wm else wm
+                    x = max(0, min(x, sw - w))
             if wm is None and w >= px(self.MEETINGS_MIN_WIDTH):
                 # saved by an older Sidenote while on Past meetings: that width
                 # isn't the New meeting width
@@ -5937,6 +6517,8 @@ class Overlay:
             g["w"] = self._tab_w["live"] or g["w"]
             if self._tab_w["meetings"]:
                 g["w_meetings"] = self._tab_w["meetings"]
+            if IS_MAC:
+                g["layout_scale"] = MAC_UI_SCALE         # widths below were made for this
             os.makedirs(SAVE_DIR, exist_ok=True)
             with open(self.GEOMETRY_FILE, "w") as f:
                 json.dump(g, f)
@@ -6003,8 +6585,8 @@ class Overlay:
         size = 8 if compact else 9
         for chip in self.chips.values():
             chip["frame"].configure(padx=4 if compact else 6)
-            chip["box"].configure(font=(FONT, size))
-            chip["name"].configure(font=(FONT, size))
+            chip["box"].configure(font=(FONT, fs(size)))
+            chip["name"].configure(font=(FONT, fs(size)))
         self.show_label.pack_forget()
 
     def _fit_chips(self, width=None):
@@ -6106,9 +6688,41 @@ class Overlay:
         cache = getattr(self, "_row_cache", {})
         spacing = px(9) if spacing is None else spacing
         if (size, spacing) not in cache:
-            cache[(size, spacing)] = tkfont.Font(family=FONT, size=size).metrics("linespace") + spacing
+            cache[(size, spacing)] = tkfont.Font(family=FONT, size=fs(size)).metrics("linespace") + spacing
             self._row_cache = cache
         return cache[(size, spacing)]
+
+    MIN_PANEL_ROWS = 5          # an open list never shows fewer lines than this
+
+    def _grow_for_lists(self, short):
+        """The window is too short for five lines of the open list: make it
+        taller by what's missing (up to the screen), then lay out again.
+        False if it can't grow (already as tall as the screen)."""
+        try:
+            if self.root.state() == "zoomed" or getattr(self, "_growing", False):
+                return False
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            sh = self.root.winfo_screenheight()
+            new_h = min(h + short + px(6), sh - px(40))
+            if new_h <= h:
+                return False
+            y = max(0, min(y, sh - new_h - px(30)))   # keep the bottom on screen
+            self._growing = True
+            self.root.geometry(f"{w}x{new_h}+{x}+{y}")
+
+            def again():
+                self._growing = False
+                self._layout()
+            self.root.after(80, again)
+            return True
+        except Exception:
+            return False
+
+    def _panel_min(self, key):
+        """Smallest height of an open list: its title and MIN_PANEL_ROWS lines
+        (fewer when the list is shorter)."""
+        return self._content_height(key, max_rows=self.MIN_PANEL_ROWS)
 
     def _head_height(self, key):
         """Height of a list's title row and divider, measured on screen."""
@@ -6123,11 +6737,18 @@ class Overlay:
         """Height that shows every row of a list (measured with the real font,
         so it works with any Windows display scaling)."""
         text = self.panel_text[key]
+        per_row = self._row_height()
         try:
             text.update_idletasks()
-            rows = int(text.count("1.0", "end", "displaylines")[0])
+            lines = int(text.count("1.0", "end", "displaylines")[0] or 0)
+            rows = lines
             if text.get("end-2c", "end-1c") == "\n":
                 rows -= 1                     # the empty line after the last item
+            # the real height of a line as drawn (spacing, symbols, bold names),
+            # not a guess from the font: a guess left lists cut off
+            pixels = int((text.count("1.0", "end", "ypixels") or [0])[0] or 0)
+            if lines > 0 and pixels > 0:
+                per_row = max(per_row, -(-pixels // lines))
         except Exception:
             rows = 3
         if key == "transcript":
@@ -6135,7 +6756,8 @@ class Overlay:
         rows = max(1, rows)
         if max_rows:
             rows = min(rows, max_rows)
-        return self._head_height(key) + rows * self._row_height() + px(10)
+        inner = 2 * (int(text.cget("pady")) + int(text.cget("borderwidth"))) + px(6)
+        return self._head_height(key) + rows * per_row + inner
 
     def _answer_needed(self, total):
         return max(self._row_height(10, 8) * 2 + 40,
@@ -6157,6 +6779,18 @@ class Overlay:
             answer_needed = max(self._answer_needed(total), int(total * 0.34))
             wanted = {k: self._content_height(k) for k in self.visible}
             gaps = px(16) * len(self.visible)
+            # Every open list shows at least MIN_PANEL_ROWS lines (or all its rows):
+            # the answer gives way first, down to its own two-line minimum.
+            floor = {k: self._content_height(k, max_rows=self.MIN_PANEL_ROWS)
+                     for k in self.visible}
+            for k in self.visible:
+                self.paned.paneconfigure(self.panels[k], minsize=floor[k])
+            answer_min = self._row_height(10, 8) * 2 + 40
+            short = sum(floor.values()) + answer_min + gaps - total
+            if short > 0 and self._grow_for_lists(short):
+                return                               # laid out again once taller
+            answer_needed = max(answer_min,
+                                min(answer_needed, total - sum(floor.values()) - gaps))
             free = total - answer_needed - gaps
             if sum(wanted.values()) <= free:
                 # everything fits: lists show all rows, the answer gets the rest
@@ -6165,9 +6799,8 @@ class Overlay:
                 self.paned.paneconfigure(self.body, stretch="always",
                                          height=total - sum(wanted.values()) - gaps)
             else:
-                # not enough room: the answer keeps a third of the window; open
-                # lists share the rest (at least two rows each) and scroll inside
-                floor = {k: self._content_height(k, max_rows=2) for k in self.visible}
+                # not enough room: the answer keeps what's left after five rows
+                # of each open list; lists share the rest and scroll inside
                 if sum(floor.values()) > free:     # many lists, small window: equal shares
                     share = max(px(60), free // len(self.visible))
                     heights = {k: share for k in self.visible}
@@ -6245,6 +6878,25 @@ class Overlay:
             None,
             ("new", "New meeting", self.new_meeting, True),
         ]
+        if IS_MAC:
+            # macOS: the borderless panel below can open behind the always-on-top
+            # window, and its mouse grab then takes every click: the window looks
+            # frozen. A native menu always shows on top and closes by itself.
+            menu = tk.Menu(self.root, tearoff=0, font=(FONT, fs(10)))
+            for item in items:
+                if item is None:
+                    menu.add_separator()
+                    continue
+                _key, label, command, enabled = item
+                menu.add_command(label=label, command=command,
+                                 state="normal" if enabled else "disabled")
+            x = self.menu_btn.winfo_rootx()
+            y = self.menu_btn.winfo_rooty() + self.menu_btn.winfo_height()
+            try:
+                menu.tk_popup(x, y)
+            finally:
+                menu.grab_release()
+            return "break"
         win = tk.Toplevel(self.root)
         win.wm_overrideredirect(True)
         win.attributes("-topmost", True)
@@ -6267,7 +6919,7 @@ class Overlay:
                               font=(glyph_font[0][0], 10), width=2, anchor="w")
                 ic.pack(side="left", padx=(0, px(8)))
                 parts.append(ic)
-            lab = tk.Label(row, text=label, bg=SURFACE, fg=fg, font=(FONT, 10), anchor="w")
+            lab = tk.Label(row, text=label, bg=SURFACE, fg=fg, font=(FONT, fs(10)), anchor="w")
             lab.pack(side="left", fill="x", expand=True)
             parts.append(lab)
             if not enabled:
@@ -6341,28 +6993,28 @@ class Overlay:
         except Exception:
             pass
         fields = {}
-        tk.Label(win, text="Meeting info", bg=BG, fg=FG, font=(FONT, 12, "bold"),
+        tk.Label(win, text="Meeting info", bg=BG, fg=FG, font=(FONT, fs(12), "bold"),
                  anchor="w").pack(fill="x", padx=18, pady=(16, 0))
         tk.Label(win, text="Claude uses this for every answer. Anything left empty stays "
-                 "empty in the meeting file.", bg=BG, fg=MUTED, font=(FONT, 8), anchor="w",
+                 "empty in the meeting file.", bg=BG, fg=MUTED, font=(FONT, fs(8)), anchor="w",
                  justify="left", wraplength=380).pack(fill="x", padx=18, pady=(2, 6))
 
         def row(label, key, value, multiline=False):
-            tk.Label(win, text=label, bg=BG, fg=MUTED, font=(FONT, 9),
+            tk.Label(win, text=label, bg=BG, fg=MUTED, font=(FONT, fs(9)),
                      anchor="w").pack(fill="x", padx=18, pady=(8, 3))
             frame = tk.Frame(win, bg=SURFACE, highlightthickness=1,
                              highlightbackground=LINE, highlightcolor=ACCENT)
             frame.pack(fill="x", padx=18)
             if multiline:
                 box = tk.Text(frame, height=5, width=44, bg=SURFACE, fg=FG,
-                              insertbackground=FG, relief="flat", font=(FONT, 10),
+                              insertbackground=FG, relief="flat", font=(FONT, fs(10)),
                               wrap="word", borderwidth=0, padx=8, pady=6,
                               highlightthickness=0)
                 box.insert("1.0", value)
                 box.pack(fill="x")
             else:
                 box = tk.Entry(frame, width=44, bg=SURFACE, fg=FG, insertbackground=FG,
-                               relief="flat", font=(FONT, 10), borderwidth=0,
+                               relief="flat", font=(FONT, fs(10)), borderwidth=0,
                                highlightthickness=0)
                 box.insert(0, value)
                 box.pack(fill="x", padx=8, ipady=6)
@@ -6403,12 +7055,12 @@ class Overlay:
 
         buttons = tk.Frame(win, bg=BG)
         buttons.pack(fill="x", padx=18, pady=16)
-        save_btn = tk.Label(buttons, text="Save", bg=ACCENT, fg="#ffffff", font=(FONT, 9, "bold"),
+        save_btn = tk.Label(buttons, text="Save", bg=ACCENT, fg="#ffffff", font=(FONT, fs(9), "bold"),
                             padx=18, pady=6, cursor="hand2")
         save_btn.pack(side="right")
         save_btn.bind("<Button-1>", save)
         self._hover(save_btn, ACCENT, ACCENT_HI)
-        cancel = tk.Label(buttons, text="Cancel", bg=BG, fg=MUTED, font=(FONT, 9),
+        cancel = tk.Label(buttons, text="Cancel", bg=BG, fg=MUTED, font=(FONT, fs(9)),
                           padx=12, pady=6, cursor="hand2")
         cancel.pack(side="right", padx=(0, 6))
         cancel.bind("<Button-1>", lambda e: win.destroy())
@@ -6555,7 +7207,7 @@ class Overlay:
                                 lambda: self.select_tab("meetings"))
         self.tab_past.pack(side="left", padx=(4, 0))
         self.menu_btn = tk.Label(bar, text="⋯", bg=BG, fg=MUTED, cursor="hand2",
-                                 font=(FONT, 15), padx=6)
+                                 font=(FONT, fs(15)), padx=6)
         self.menu_btn.pack(side="right")
         self.menu_btn.bind("<Button-1>", self.open_menu)
         self._hover(self.menu_btn, BG, SURFACE, fg_on=FG, fg_off=MUTED)
@@ -6644,11 +7296,11 @@ class Overlay:
         self.start = tk.Frame(self.root, bg=BG)
         inner = tk.Frame(self.start, bg=BG)
         inner.place(relx=0.5, rely=0.42, anchor="center", relwidth=0.86)
-        tk.Label(inner, text="New meeting", bg=BG, fg=FG, font=(SERIF, 22),
+        tk.Label(inner, text="New meeting", bg=BG, fg=FG, font=(SERIF, fs(22)),
                  anchor="w").pack(fill="x")
         self.start_sub = tk.Label(
             inner, text="Sidenote reads your call's captions, keeps the agenda and action "
-                        "items, and answers your questions.", bg=BG, fg=MUTED, font=(FONT, 10),
+                        "items, and answers your questions.", bg=BG, fg=MUTED, font=(FONT, fs(10)),
             anchor="w", justify="left", wraplength=px(330))
         self.start_sub.pack(fill="x", pady=(6, 22))
         btn = Pill(inner, "●  Start meeting", fg="#ffffff", bg=ACCENT, size=11,
@@ -6657,11 +7309,18 @@ class Overlay:
         btn.bind("<Enter>", lambda e: btn.set("●  Start meeting", "#ffffff", ACCENT_HI))
         btn.bind("<Leave>", lambda e: btn.set("●  Start meeting", "#ffffff", ACCENT))
         tk.Label(inner, text="Works with Google Meet, Zoom (browser), Microsoft Teams and "
-                             "Live Captions.", bg=BG, fg=FAINT, font=(FONT, 8), anchor="w",
+                             "Live Captions.", bg=BG, fg=FAINT, font=(FONT, fs(8)), anchor="w",
                  justify="left", wraplength=px(330)).pack(fill="x", pady=(14, 0))
+        # Mac: shown while macOS doesn't let Sidenote read other windows
+        self.start_access = tk.Label(inner, text=AX_HELP if IS_MAC else "", bg=BG, fg=WARN,
+                                     font=(FONT, fs(9)), anchor="w", justify="left",
+                                     wraplength=px(330), cursor="hand2")
+        if IS_MAC:
+            self.start_access.bind("<Button-1>", self._open_ax_settings)
+        self._start_access_shown = False
         self.start_offline = tk.Label(inner, text="Claude is not connected \u00b7 type "
                                                   "\u201copen Sidenote\u201d in a Claude chat",
-                                      bg=BG, fg=FAINT, font=(FONT, 9), anchor="w", justify="left",
+                                      bg=BG, fg=FAINT, font=(FONT, fs(9)), anchor="w", justify="left",
                                       wraplength=px(330))
         self._start_offline_shown = False
 
@@ -6721,9 +7380,9 @@ class Overlay:
         """'Claude isn't connected' + one click to copy 'open Sidenote'."""
         row = tk.Frame(parent, bg=bg)
         tk.Label(row, text="Claude isn't connected ·", bg=bg, fg=WARN,
-                 font=(FONT, 9)).pack(side="left")
+                 font=(FONT, fs(9))).pack(side="left")
         copy = tk.Label(row, text="Copy “open Sidenote”", bg=bg, fg=ACCENT_HI,
-                        font=(FONT, 9, "underline"), cursor="hand2")
+                        font=(FONT, fs(9), "underline"), cursor="hand2")
         copy.pack(side="left", padx=(6, 0))
         copy.bind("<Button-1>", self._copy_open_line)
         Tooltip(copy, "Paste it into a Claude chat to connect")
@@ -6735,16 +7394,16 @@ class Overlay:
         side = tk.Frame(self.hist, bg=BG, width=px(240))
         side.pack(side="left", fill="y", padx=(px(10), 0), pady=(px(8), 0))
         side.pack_propagate(False)
-        self.h_list = tk.Text(side, wrap="none", bg=BG, fg=FG, relief="flat", font=(FONT, 9),
+        self.h_list = tk.Text(side, wrap="none", bg=BG, fg=FG, relief="flat", font=(FONT, fs(9)),
                               padx=px(4), pady=px(2), borderwidth=0, highlightthickness=0,
                               cursor="arrow")
         self.h_list.pack(fill="both", expand=True)
         L = self.h_list
-        L.tag_configure("group", foreground=FAINT, font=(FONT, 8, "bold"), lmargin1=px(10),
+        L.tag_configure("group", foreground=FAINT, font=(FONT, fs(8), "bold"), lmargin1=px(10),
                         spacing1=px(26), spacing3=px(8))
-        L.tag_configure("row_title", foreground=FG, font=(FONT, 9, "bold"), lmargin1=px(10),
+        L.tag_configure("row_title", foreground=FG, font=(FONT, fs(9), "bold"), lmargin1=px(10),
                         spacing1=px(7))
-        L.tag_configure("row_meta", foreground=FAINT, font=(FONT, 8), lmargin1=px(10),
+        L.tag_configure("row_meta", foreground=FAINT, font=(FONT, fs(8)), lmargin1=px(10),
                         spacing1=px(2), spacing3=px(7))
         L.tag_configure("hover", background=SURFACE)
         L.tag_configure("picked", background=SURFACE_HI)      # the meeting shown in the center
@@ -6762,7 +7421,7 @@ class Overlay:
         self.h_pill = InputPill(ask, self.history_ask)
         self.h_pill.pack(fill="x")
         self.h_entry = tk.Entry(self.h_pill, bg=SURFACE, fg=FG, insertbackground=FG,
-                                relief="flat", font=(FONT, 10), borderwidth=0, highlightthickness=0,
+                                relief="flat", font=(FONT, fs(10)), borderwidth=0, highlightthickness=0,
                                 disabledbackground=SURFACE, disabledforeground=FAINT)
         self.h_pill.hold(self.h_entry)
         self.h_entry.bind("<Return>", lambda e: self.history_ask())
@@ -6775,21 +7434,21 @@ class Overlay:
                                       sashrelief="flat", showhandle=False, opaqueresize=True)
         self.h_paned.pack(fill="both", expand=True)
         self.h_text = tk.Text(self.h_paned, wrap="word", bg=BG, fg=FG, relief="flat",
-                              font=(FONT, 10), padx=px(6), pady=px(4), borderwidth=0,
+                              font=(FONT, fs(10)), padx=px(6), pady=px(4), borderwidth=0,
                               highlightthickness=0, cursor="arrow", spacing1=px(3),
                               spacing2=px(3), spacing3=px(3))
         self.h_paned.add(self.h_text, stretch="always", minsize=px(120))
         t = self.h_text
-        t.tag_configure("big", font=(SERIF, 19), foreground=FG, spacing3=px(10))
-        t.tag_configure("meta", foreground=FAINT, font=(FONT, 8))
-        t.tag_configure("people", foreground=FAINT, font=(FONT, 8), spacing1=px(8))
+        t.tag_configure("big", font=(SERIF, fs(19)), foreground=FG, spacing3=px(10))
+        t.tag_configure("meta", foreground=FAINT, font=(FONT, fs(8)))
+        t.tag_configure("people", foreground=FAINT, font=(FONT, fs(8)), spacing1=px(8))
         t.tag_configure("muted", foreground=MUTED)
-        t.tag_configure("section", foreground=MUTED, font=(FONT, 9, "bold"), spacing1=px(24),
+        t.tag_configure("section", foreground=MUTED, font=(FONT, fs(9), "bold"), spacing1=px(24),
                         spacing3=px(8))
         t.tag_configure("item", lmargin1=px(4), lmargin2=px(28), spacing1=px(4), spacing3=px(4))
         t.tag_configure("bullet", lmargin1=px(4), lmargin2=px(20), spacing1=px(3), spacing3=px(3))
         t.tag_configure("meta_line", lmargin1=px(30), lmargin2=px(30), spacing3=px(6))
-        t.tag_configure("dec_meeting", foreground=ACCENT_HI, font=(FONT, 9, "bold"),
+        t.tag_configure("dec_meeting", foreground=ACCENT_HI, font=(FONT, fs(9), "bold"),
                         spacing1=px(12), lmargin1=px(4))
         t.tag_configure("dec_date", spacing1=px(12))
         t.tag_configure("dec_item", lmargin1=px(14), lmargin2=px(30))
@@ -6797,7 +7456,7 @@ class Overlay:
         t.tag_configure("check", foreground=OK)
         t.tag_configure("box", foreground=MUTED)
         t.tag_configure("done", foreground=FAINT, overstrike=True)
-        t.tag_configure("claude_badge", foreground=ACCENT_HI, font=(FONT, 8))
+        t.tag_configure("claude_badge", foreground=ACCENT_HI, font=(FONT, fs(8)))
         t.tag_configure("hover", background=SURFACE)
         t.tag_configure("faint", foreground=FAINT)
         t.configure(state="disabled")
@@ -6806,19 +7465,19 @@ class Overlay:
         tk.Frame(self.h_chat, bg=LINE, height=1).pack(fill="x")
         head = tk.Frame(self.h_chat, bg=BG)
         head.pack(fill="x", pady=(px(8), px(2)))
-        tk.Label(head, text="Conversation", bg=BG, fg=MUTED, font=(FONT, 9, "bold")).pack(side="left")
-        clear = tk.Label(head, text="Clear", bg=BG, fg=FAINT, font=(FONT, 8), cursor="hand2")
+        tk.Label(head, text="Conversation", bg=BG, fg=MUTED, font=(FONT, fs(9), "bold")).pack(side="left")
+        clear = tk.Label(head, text="Clear", bg=BG, fg=FAINT, font=(FONT, fs(8)), cursor="hand2")
         clear.pack(side="right")
         clear.bind("<Button-1>", lambda e: self._h_clear_chat())
         self._hover(clear, BG, BG, fg_on=FG, fg_off=FAINT)
         self.h_chat_text = tk.Text(self.h_chat, wrap="word", bg=BG, fg=FG, relief="flat",
-                                   font=(FONT, 10), padx=px(6), pady=px(4), borderwidth=0,
+                                   font=(FONT, fs(10)), padx=px(6), pady=px(4), borderwidth=0,
                                    highlightthickness=0, cursor="arrow", spacing2=px(3))
         self.h_chat_text.pack(fill="both", expand=True)
         c = self.h_chat_text
-        c.tag_configure("you_name", foreground=MUTED, font=(FONT, 8, "bold"), spacing1=px(14))
-        c.tag_configure("you", foreground=FG, font=(FONT, 10, "bold"), spacing3=px(4))
-        c.tag_configure("claude_name", foreground=ACCENT, font=(FONT, 8, "bold"), spacing1=px(10))
+        c.tag_configure("you_name", foreground=MUTED, font=(FONT, fs(8), "bold"), spacing1=px(14))
+        c.tag_configure("you", foreground=FG, font=(FONT, fs(10), "bold"), spacing3=px(4))
+        c.tag_configure("claude_name", foreground=ACCENT, font=(FONT, fs(8), "bold"), spacing1=px(10))
         c.tag_configure("claude", foreground=FG, spacing3=px(4))
         c.tag_configure("hint", foreground=FAINT, spacing1=px(10))
         c.tag_configure("note", foreground=WARN, spacing1=px(10))
@@ -7195,10 +7854,40 @@ class Overlay:
             return "Claude paused \u00b7 type 'continue' in the Claude app", WARN
         return "Claude not connected · type 'continue' in the Claude app", FAINT
 
+    def _sync_access_hint(self):
+        """Show the Home screen's permission line only while it is needed."""
+        want = self._ax_blocked()
+        if want:
+            text = ("Allowed. Quit Claude (Cmd+Q) and open it again to finish."
+                    if AX_ACCESS["restart"] else AX_HELP)
+            if self.start_access.cget("text") != text:
+                self.start_access.configure(text=text)
+        if want != self._start_access_shown:
+            self._start_access_shown = want
+            if want:
+                self.start_access.pack(fill="x", pady=(14, 0))
+            else:
+                self.start_access.pack_forget()
+
     def _mic_fixable(self):
         return IS_MAC and mic.status in MIC_NEEDS_USER and transcript.source not in NAMED_SOURCES
 
+    def _open_ax_settings(self, _e=None):
+        """Open the macOS list where Sidenote (its Python) must be switched on."""
+        try:
+            import subprocess
+            subprocess.Popen(["open", AX_SETTINGS_URL])
+            self.toast(f"Turn on \u201c{AX_APP_NAME}\u201d in the list (macOS's name for Sidenote)", seconds=8)
+        except Exception as e:
+            log.info("Could not open Privacy settings: %s", e)
+
+    def _ax_blocked(self):
+        return IS_MAC and AX_ACCESS["ok"] is False
+
     def _footer_click(self):
+        if IS_MAC and AX_ACCESS["ok"] is False:
+            self._open_ax_settings()
+            return
         if self._mic_fixable():
             retry_mic()
             self.toast("Trying the microphone again…")
@@ -7207,13 +7896,18 @@ class Overlay:
         """Footer, right side: which transcript source is active and its health."""
         if live.mode != "record":
             return "Not recording", FAINT
+        if IS_MAC and AX_ACCESS["ok"] is False:
+            if AX_ACCESS["restart"]:
+                return "Allowed \u00b7 quit Claude (Cmd+Q) and open it again to finish", WARN
+            return f"Can't read Meet \u00b7 click, turn on \u201c{AX_APP_NAME}\u201d", WARN
         status, source = transcript.status, transcript.source
         if source in NAMED_SOURCES:
             if status.startswith(f"{source} captions connected"):
                 return f"{source} captions", OK
             return f"{source} \u00b7 reconnecting", WARN
         if captions_win.note:
-            return "Live Captions is docked: set it to 'Floating on screen'", WARN
+            return (captions_win.note if IS_MAC else
+                    "Live Captions is docked: set it to 'Floating on screen'"), WARN
         label = LC_SHORT
         if not IS_MAC and LC_MIC["state"] == "on":
             label += " + your mic"
@@ -7240,7 +7934,8 @@ class Overlay:
         if "waiting for speech" in status:
             return label + " \u00b7 waiting for speech", FAINT
         if "Accessibility" in status:
-            return "Allow Claude: Privacy & Security > Device Control", WARN
+            return (f"Click to allow \u201c{AX_APP_NAME}\u201d in {AX_PAGE}"
+                    if IS_MAC else "Allow Claude: Privacy & Security > Device Control"), WARN
         return ("Captions off \u00b7 turn on Live Captions" if IS_MAC
                 else "Captions off \u00b7 " + LC_HINT), WARN
 
@@ -7310,7 +8005,8 @@ class Overlay:
             n = len(transcript.people())
             self.p_people.set(f"{n} {'person' if n == 1 else 'people'}" if n else "")
             self.p_source.set(ctext if recording else "", WARN if ccolor == WARN else MUTED,
-                              clickable=self._mic_fixable())
+                              clickable=self._mic_fixable() or self._ax_blocked())
+        self._sync_access_hint()
         self.tab_live.set(badge=recording)
         self._sync_top_btn()
 
@@ -7350,8 +8046,9 @@ class Overlay:
             # insert before the next visible panel, or before the answer
             later = [k for k in self.visible if self.PANEL_ORDER.index(k) > self.PANEL_ORDER.index(key)]
             before = self.panels[later[0]] if later else self.body
-            self.paned.add(self.panels[key], before=before, minsize=64,
-                           height=self._panel_height(key), stretch="always")
+            self.paned.add(self.panels[key], before=before, minsize=self._panel_min(key),
+                           height=max(self._panel_height(key), self._panel_min(key)),
+                           stretch="always")
             if key == "transcript":
                 self._last_transcript_count = -1
                 self.render_transcript()
@@ -7370,7 +8067,7 @@ class Overlay:
             return max(120, share)
         with transcript.lock:
             n = len(transcript.context[key])
-        return max(70, min(40 + max(1, n) * 24, share))
+        return max(70, min(40 + max(1, n) * self._row_height(), share))
 
     def _chip_hover(self, key, on):
         chip = self.chips[key]
@@ -7542,7 +8239,7 @@ class Overlay:
         """One click: a short list of the people in the meeting (the user by
         name, participants, names heard), plus Team and Other."""
         menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=FG, activebackground=ACCENT,
-                       activeforeground="#ffffff", bd=0, font=(FONT, 9))
+                       activeforeground="#ffffff", bd=0, font=(FONT, fs(9)))
         for person in transcript.people():
             menu.add_command(label=person, command=lambda p=person: self._set_owner(index, p))
         menu.add_command(label="Team", command=lambda: self._set_owner(index, "Team"))
@@ -7617,7 +8314,7 @@ class Overlay:
             return ""
         import tkinter.font as tkfont
         if not hasattr(self, "_tail_font"):
-            self._tail_font = tkfont.Font(family=FONT, size=8, slant="italic")
+            self._tail_font = tkfont.Font(family=FONT, size=fs(8), slant="italic")
         width = max(150, int(self.tail.cget("wraplength") or 300))
         budget = width * 2 * 0.85            # two lines, with a safety margin for wrapping
         words = text.split()

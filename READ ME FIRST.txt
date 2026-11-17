@@ -21,12 +21,15 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
 
 4. Quit Claude completely (Cmd+Q) and open it again.
 
-5. Allow Claude to read other apps
+5. Allow Claude and Sidenote to read other apps
    System Settings > Privacy & Security, then scroll down the list on the right
    and click "Device Control and Data Access" (on older macOS it is called
    "Accessibility" and is near the top of that list). Turn ON Claude.
    If Claude isn't in the list, click + at the bottom, choose
    Applications > Claude, and confirm with your password or Touch ID.
+   Since Claude's November update Sidenote needs its own switch too: when
+   Sidenote asks (or shows an orange line with a name, e.g. "uv"), click the
+   line and turn ON exactly that name in the same list.
    Note: the "Accessibility" item in the left sidebar of System Settings is a
    different page (display and zoom settings). Don't use that one here.
    Then quit and reopen Claude once more.
@@ -47,8 +50,9 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
      tab in front; Sidenote tells you if it's in a background tab.
    - Microsoft Teams (the app or in the browser): Sidenote turns on Teams' live
      captions by itself (More > Language and speech) and reads them with names.
-   - Other apps (Zoom app, videos, ...): Sidenote turns on macOS Live Captions by
-     itself and hides its window. Live Captions hears the other people; your
+   - Other apps (Zoom app, videos, ...), or Meet in a background tab: Sidenote
+     turns on macOS Live Captions by itself (System Settings may flash for a
+     moment) and hides its window. Live Captions hears the other people; your
      own voice comes from your microphone, transcribed on your Mac.
      The first time, macOS asks "Claude would like to access the microphone":
      click Allow. Then Sidenote downloads its speech model once (about 150 MB;

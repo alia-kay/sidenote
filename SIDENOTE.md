@@ -1,6 +1,6 @@
 # Sidenote
 
-Version: 2026-11-10 v6 (Mac + Windows merged)
+Version: 2026-11-17 v16
 
 ## Objective
 
@@ -21,12 +21,14 @@ How it works: Sidenote is a local MCP server for the Claude desktop app, on Wind
 ## Transcript sources
 
 - Google Meet captions in Chrome or Edge, with speaker names (Windows and Mac). This is the preferred source.
-- Sidenote turns on Meet captions by itself. It presses the CC button and the "Turn on captions" item in its menu, without moving the mouse or pressing keys. It tries at most 2 times per meeting. If you turn captions off on purpose, it leaves them off.
+- When a Google Meet call opens (a Meet tab with a meeting code, in front or in the background) while the Sidenote window is open and not recording, Sidenote starts the meeting by itself (v14). Each call starts a meeting once; ending it never restarts it for the same call.
+- Sidenote turns on Meet captions by itself (confirmed on Mac 2026-11-17 with Meet's 'Captions and translation' button, which macOS shows as a toggle with no value). It presses the CC button and the "Turn on captions" item in its menu, without moving the mouse or pressing keys. It tries at most 3 times per meeting. If you turn captions off on purpose, it leaves them off.
 - Zoom meetings in the browser (Zoom's web client), Windows and Mac: Sidenote turns on Zoom's captions (Show Captions, on the bar or under More, once per meeting) and reads the rolling caption line. Speaker names are used when Zoom shows them. The Zoom tab must be in front; a toast says so if it's in a background tab.
 - Microsoft Teams meetings, in the Teams app or in the browser, Windows and Mac: Sidenote turns on Teams' live captions (More > Language and speech, once per meeting) and reads them with speaker names. It uses Teams' element ids, so it works in any Teams language. The user's own Teams display name is treated as the user.
 - Windows Live Captions as a fallback, for the Zoom app, videos and any other app. It can include your own microphone.
-- macOS Live Captions as a fallback on Mac. Sidenote turns it on by itself, hides its window, and switches it off when Sidenote closes. It hears the other people; the user's own voice comes from the microphone, transcribed on the Mac with Whisper (through Claude's microphone permission; Sidenote asks macOS for it, and says so in the footer if access is blocked or the mic gives only silence).
-- If Meet captions are lost, Sidenote switches to Live Captions automatically.
+- macOS Live Captions as a fallback on Mac. Sidenote turns it on by itself (it finds the switch on macOS 27 too, in any language, and checks that macOS saved it), hides its window, and switches it off when Sidenote closes. Live Captions must listen to the computer's audio: if it was set to Microphone or paused, Sidenote sets it back to Computer Audio and starts it. It hears the other people; the user's own voice comes from the microphone, transcribed on the Mac with Whisper (through Claude's microphone permission; Sidenote asks macOS for it, and says so in the footer if access is blocked or the mic gives only silence).
+- If Meet captions are lost, Sidenote switches to Live Captions automatically. Short gaps (Meet redraws its captions during pauses) don't count as lost.
+- On Mac, Meet works in Chrome, Edge, Brave, Arc, Dia, Vivaldi, Opera, Comet and Safari. Only the tab in front can be read: if Meet is in a background tab, Sidenote says so and uses Live Captions meanwhile.
 
 ## The Sidenote window
 
@@ -96,12 +98,18 @@ open_sidenote, close_sidenote, wait_for_question, show_suggestion, update_meetin
 
 - A single Python file, sidenote.py, runs as a local MCP server started by the Claude desktop app.
 - Windows requirements: pip install mcp uiautomation. Mac requirements: pip install mcp pyobjc-framework-ApplicationServices pyobjc-framework-Cocoa.
-- On Mac, Claude needs permission in Privacy & Security > Device Control and Data Access (called Accessibility on older macOS).
+- On Mac, Sidenote needs its own Accessibility permission: since Claude's November 2026 update, extensions run as processes of their own (through Claude's 'disclaimer' helper), so Claude's permission no longer covers them. macOS checks the program Claude's 'disclaimer' helper started: uv when the extension runs with 'uv run' (python3.13 only when Python is started directly). Sidenote finds that program by walking up its parent processes, names it in an orange clickable line (Home screen and footer) that opens the settings page, and asks macOS once.
+- The ⋯ menu is a native menu on Mac (v14): the custom panel with a mouse grab could open behind the window and freeze it.
+- Mac text is 50% larger in v15: Tk on macOS draws a 9 pt font as 9 px and ignores 'tk scaling' for fonts, so every font size goes through fs(). The window and spacing stay as in v13 (scaling 1.45); v14's wider window is undone.
+- Open lists always show at least 5 lines (measured from the drawn lines, not estimated); a window too short for that grows taller, up to the screen.
+- If macOS only applies the Accessibility switch to a new process, the footer says to quit and reopen Claude.
+- Mac mic (v15): the hearing line shows your words while you talk (a quick Whisper pass every 1.5 s of speech); a phrase is saved after a pause or at 8 s (was 12 s, which with call audio from the speakers meant a 12 s delay).
 - Only one copy of Sidenote owns the window. Other chats talk to it locally (127.0.0.1).
 
 ## Still open
 
 - Own-microphone transcription on Mac is back (v9), not yet confirmed on a real Mac. If macOS still gives only silence with permission granted, the fallback is a separate helper app with its own mic permission.
 - Old Sidenote processes on Mac can survive quitting Claude and need sudo pkill. Sidenote should exit when Claude disconnects.
-- Live Captions was "not found" on the very first Mac try. Keep an eye on it.
+- Live Captions on macOS 27: confirmed on a real Mac (2026-11-17): Sidenote finds the switch (identifier on the row) and turns it on. Earlier it failed because Sidenote had no Accessibility permission, see below.
+- macOS Live Captions' controls seen on a real Mac: a source pop-up ('Computer Audio' / 'Microphone') and a 'Live Captions running' button. Sidenote keeps it on Computer Audio.
 - The Mac + Windows merged version hasn't been tested in a real meeting yet.
