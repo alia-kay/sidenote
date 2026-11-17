@@ -21,7 +21,7 @@ How it works: Sidenote is a local MCP server for the Claude desktop app, on Wind
 ## Transcript sources
 
 - Google Meet captions in Chrome or Edge, with speaker names (Windows and Mac). This is the preferred source.
-- When a Google Meet call opens (a Meet tab with a meeting code, in front or in the background) while the Sidenote window is open and not recording, Sidenote starts the meeting by itself (v14). Each call starts a meeting once; ending it never restarts it for the same call.
+- When a Google Meet call opens (a Meet tab with a meeting code, in front or in the background) while the Sidenote window is open and not recording, Sidenote starts the meeting by itself (v14). Microsoft Teams calls too (v17): Teams showing its Leave button, checked every 10 s with a capped search. Each call starts a meeting once; ending it never restarts it for the same call. A Teams call that is over is forgotten, so the next one starts a meeting again.
 - Sidenote turns on Meet captions by itself (confirmed on Mac 2026-11-17 with Meet's 'Captions and translation' button, which macOS shows as a toggle with no value). It presses the CC button and the "Turn on captions" item in its menu, without moving the mouse or pressing keys. It tries at most 3 times per meeting. If you turn captions off on purpose, it leaves them off.
 - Zoom meetings in the browser (Zoom's web client), Windows and Mac: Sidenote turns on Zoom's captions (Show Captions, on the bar or under More, once per meeting) and reads the rolling caption line. Speaker names are used when Zoom shows them. The Zoom tab must be in front; a toast says so if it's in a background tab.
 - Microsoft Teams meetings, in the Teams app or in the browser, Windows and Mac: Sidenote turns on Teams' live captions (More > Language and speech, once per meeting) and reads them with speaker names. It uses Teams' element ids, so it works in any Teams language. The user's own Teams display name is treated as the user.
@@ -103,6 +103,8 @@ open_sidenote, close_sidenote, wait_for_question, show_suggestion, update_meetin
 - Mac text is 50% larger in v15: Tk on macOS draws a 9 pt font as 9 px and ignores 'tk scaling' for fonts, so every font size goes through fs(). The window and spacing stay as in v13 (scaling 1.45); v14's wider window is undone.
 - Open lists always show at least 5 lines (measured from the drawn lines, not estimated); a window too short for that grows taller, up to the screen.
 - If macOS only applies the Accessibility switch to a new process, the footer says to quit and reopen Claude.
+- A minimized or hidden window comes back when the user types "open Sidenote" again, or (Mac) clicks Sidenote's Dock icon (v17).
+- Teams on Mac (v17): the reader logs its status, and once per window the Teams element ids it saw (ids only), so a failed Teams test can be read from Claude's log.
 - Closing Sidenote switches macOS Live Captions off reliably (v16): Sidenote waits up to 15 s when System Settings has to start, checks the saved switch afterwards and retries once; Claude ending Sidenote with SIGTERM also runs this.
 - Mac mic (v15): the hearing line shows your words while you talk (a quick Whisper pass every 1.5 s of speech); a phrase is saved after a pause or at 8 s (was 12 s, which with call audio from the speakers meant a 12 s delay).
 - Only one copy of Sidenote owns the window. Other chats talk to it locally (127.0.0.1).

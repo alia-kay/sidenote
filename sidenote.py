@@ -2283,17 +2283,31 @@ def meet_code(title):
 MEET_CALLS_SEEN = set()     # Meet codes already recorded (or ended) this session
 
 
+def teams_call_key(title):
+    """A stable name for a Teams call from its window title: the part before
+    '| Microsoft Teams'. Chrome adds changing bits after it ('- Microphone
+    recording - Google Chrome - <profile>'), so muting must not look like a
+    new call."""
+    name = (title or "").split("|")[0].strip().lower()
+    return "teams:" + (name or "call")
+
+
 class MeetCallWatcher:
     """While the Sidenote window is open but not recording, notices a Google Meet
-    call (a Meet tab with a meeting code, in front or not) and starts the meeting
-    by itself; the Meet reader then turns on Meet's captions. Each call starts a
-    meeting once: ending it never makes it start again for the same call."""
+    call (a Meet tab with a meeting code, in front or not) or a Microsoft Teams
+    call (Teams showing its Leave button) and starts the meeting by itself; the
+    reader then turns on that app's captions. Each call starts a meeting once:
+    ending the meeting never makes it start again for the same call. A Teams
+    call that is over is forgotten, so the next one (often with the same window
+    title) starts a meeting again."""
     EVERY = 5
+    TEAMS_EVERY = 10            # Teams windows are bigger to search: less often
 
     def __init__(self):
-        self.checked = 0.0
+        self.checked = self.teams_checked = 0.0
+        self.teams_last = ""
 
-    def tick(self, meet):
+    def tick(self, meet, teams=None):
         now = time.time()
         if now - self.checked < self.EVERY:
             return
@@ -2302,24 +2316,33 @@ class MeetCallWatcher:
             if IS_MAC and not ax_access_check():
                 return
             key = meet.call_key()
+            if teams is not None and now - self.teams_checked >= self.TEAMS_EVERY:
+                self.teams_checked = now
+                teams_key = teams.call_key()
+                if self.teams_last and teams_key != self.teams_last:
+                    MEET_CALLS_SEEN.discard(self.teams_last)    # that Teams call is over
+                self.teams_last = teams_key
+                key = key or teams_key
         except Exception as e:
-            log.info("Meet call check failed: %s", e)
+            log.info("Call check failed: %s", e)
             return
         if transcript.ended_at and getattr(self, "ended", None) != transcript.ended_at:
             self.ended = transcript.ended_at     # the user just ended a meeting: the
-            if key:                              # call open now was part of it
-                MEET_CALLS_SEEN.add(key)
+            for k in (key, self.teams_last):     # calls open now were part of it
+                if k:
+                    MEET_CALLS_SEEN.add(k)
             return
         if not key or key in MEET_CALLS_SEEN:
             return
         MEET_CALLS_SEEN.add(key)
-        log.info("Google Meet call %s found: starting a meeting", key)
+        app = "Microsoft Teams" if key.startswith("teams:") else "Google Meet"
+        log.info("%s call %s found: starting a meeting", app, key)
         live.last_activity = now
         ui_queue.put(("record", {}))
-        ui_queue.put(("toast", "Google Meet call found: meeting started, turning on captions"))
+        ui_queue.put(("toast", f"{app} call found: meeting started, turning on captions"))
 
 
-SIDENOTE_VERSION = "2026-11-17 v16"
+SIDENOTE_VERSION = "2026-11-17 v17"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -3669,6 +3692,29 @@ class TeamsReader:
             except Exception:
                 continue
 
+    def call_key(self):
+        """'teams:<window title>' while a Teams call shows its Leave button, else ''."""
+        for win in self._windows():
+            if self._find_id(win, TEAMS_IDS["hangup"]) is not None:
+                return teams_call_key(win.Name)
+        return ""
+
+    @staticmethod
+    def _find_id(root, auto_id, budget=2500):
+        """Top-level-first search with a cap: in a call the Leave button is near
+        the top, and a big chat window can't slow Sidenote down."""
+        todo, n = deque([root]), 0
+        while todo and n < budget:
+            c = todo.popleft()
+            n += 1
+            try:
+                if (c.AutomationId or "") == auto_id:
+                    return c
+                todo.extend(c.GetChildren())
+            except Exception:
+                continue
+        return None
+
     def _scan(self, root, want=None):
         found = {k: None for k in TEAMS_IDS}
         ids = {v: k for k, v in TEAMS_IDS.items()}
@@ -3770,6 +3816,7 @@ class TeamsReader:
                         f = self._scan(win)
                         if f["hangup"] is not None or f["dismiss"] is not None:
                             self.window, found = win, f
+                            MEET_CALLS_SEEN.add(teams_call_key(win.Name))
                             break
                     if found is None:
                         self.status = "Teams not found"
@@ -3805,8 +3852,35 @@ class MacTeamsReader:
         self.window = self.panel = None
         self.last_search = self.panel_seen = 0.0
         self.status = "Teams not found"
+        self.logged = ""
+        self.dumped = set()
         self.auto = AutoCaptions("Microsoft Teams", "Teams")
         self._asked = set()
+
+    def _note(self, status):
+        """Set the status; log it when it changes (for troubleshooting)."""
+        self.status = status
+        if status != self.logged:
+            self.logged = status
+            log.info("Teams: %s", status)
+
+    TEAMS_ID_HINTS = ("call", "hangup", "caption", "more", "language", "speech", "transcript")
+
+    def _dump_ids(self, win, why):
+        """Once per window: log its title and the Teams element ids that look
+        related to calls or captions (ids only, never captions or chat text)."""
+        title = str(ax(win, "AXTitle") or "")
+        if title in self.dumped:
+            return
+        self.dumped.add(title)
+        ids = []
+        for el, _ in ax_walk(win, 90):
+            dom_id = str(ax(el, "AXDOMIdentifier") or "")
+            if dom_id and any(h in dom_id.lower() for h in self.TEAMS_ID_HINTS) and dom_id not in ids:
+                ids.append(dom_id)
+            if len(ids) >= 40:
+                break
+        log.info("Teams window %r (%s): ids %s", title[:60], why, ", ".join(ids) or "none")
 
     def reset(self):
         self.window = self.panel = None
@@ -3845,6 +3919,26 @@ class MacTeamsReader:
             for win in ax(el_app, "AXWindows") or []:
                 if not in_browser or "microsoft teams" in str(ax(win, "AXTitle") or "").lower():
                     yield win
+
+    def call_key(self):
+        """'teams:<window title>' while a Teams call shows its Leave button, else ''."""
+        for win in self._windows():
+            if self._find_id(win, TEAMS_IDS["hangup"]) is not None:
+                return teams_call_key(str(ax(win, "AXTitle") or ""))
+        return ""
+
+    @staticmethod
+    def _find_id(root, dom_id, budget=2500):
+        """Top-level-first search with a cap: in a call the Leave button is near
+        the top, and a big chat window can't slow Sidenote down."""
+        todo, n = deque([root]), 0
+        while todo and n < budget:
+            el = todo.popleft()
+            n += 1
+            if str(ax(el, "AXDOMIdentifier") or "") == dom_id:
+                return el
+            todo.extend(ax(el, "AXChildren") or [])
+        return None
 
     def _scan(self, root, want=None):
         found = {k: None for k in TEAMS_IDS}
@@ -3892,6 +3986,9 @@ class MacTeamsReader:
                 if str(ax(cc, "AXValue")) in ("0", "False", "None"):
                     AXUIElementPerformAction(cc, "AXPress")
                 ok = True
+            else:
+                how += " (no Language and speech item)" if lang is None else " (no captions switch)"
+                self._dump_ids(self.window, "captions menu not found")
             if self._scan(self.window, want="lang")["lang"] is not None:
                 AXUIElementPerformAction(found["more"], "AXPress")      # close the menu
         except Exception as e:
@@ -3932,18 +4029,26 @@ class MacTeamsReader:
                     if now - self.last_search < 4:
                         return False
                     self.last_search = now
-                    found = None
+                    found, teams_windows = None, []
                     for win in self._windows():
+                        teams_windows.append(win)
                         f = self._scan(win)
                         if f["hangup"] is not None or f["dismiss"] is not None:
                             self.window, found = win, f
+                            MEET_CALLS_SEEN.add(teams_call_key(str(ax(win, "AXTitle") or "")))
                             break
                     if found is None:
-                        self.status = "Teams not found"
+                        if teams_windows:
+                            self._note("Teams open - no call found")
+                            for win in teams_windows[:3]:
+                                self._dump_ids(win, "no Leave button")
+                        else:
+                            self._note("Teams not found")
                         self._hint_background_tab(now)
                         return False
                     if found["dismiss"] is None:
-                        self.status = "Teams open - turn on live captions (More > Language and speech)"
+                        self._note("Teams call found - turning on live captions "
+                                   "(More > Language and speech)")
                         self._turn_on(found)
                         self.window = None
                         return False
@@ -3954,7 +4059,7 @@ class MacTeamsReader:
                         transcript.skip_visible = True
             self.panel_seen = now
             transcript.ingest_blocks(self._blocks())
-            self.status = "Microsoft Teams captions connected"
+            self._note("Microsoft Teams captions connected")
             return True
         except Exception as e:
             log.info("Lost Teams captions (macOS): %s", e)
@@ -4217,7 +4322,7 @@ def captions_loop():
             if IS_MAC and MAC_MIC_ENABLED:
                 update_mic(active is not None and active not in named)
             if window_open.is_set() and (live.mode != "record" or transcript.ended_at):
-                watcher.tick(meet)          # a Meet call opened: start the meeting
+                watcher.tick(meet, teams)   # a Meet or Teams call opened: start the meeting
             if not window_open.is_set() or live.mode != "record":
                 for reader in named:
                     reader.reset()
@@ -4686,6 +4791,7 @@ def core_open_sidenote(new_meeting=False, title="", agenda="", role="", goals=""
                               ("goals", goals), ("participants", participants)) if v}
     live.last_activity = time.time()
     if window_open.is_set():
+        ui_queue.put(("show", None))          # minimized, hidden or behind: bring it back
         recording = live.mode == "record" and not transcript.ended_at
         if new_meeting and not recording:
             ui_queue.put(("record", info))
@@ -4696,7 +4802,8 @@ def core_open_sidenote(new_meeting=False, title="", agenda="", role="", goals=""
         if info:
             live.pending_info.update(info)
         where = "recording a meeting" if recording else f"on its {live.mode.capitalize()} screen"
-        return f"Sidenote is already open, {where}." + LIVE_NEXT
+        return (f"Sidenote is already open, {where}; its window was brought to the front."
+                + LIVE_NEXT)
     live.pending_info = info
     live.record_on_open = bool(new_meeting)
     live.mode = "record" if new_meeting else "home"
@@ -6252,6 +6359,11 @@ class Overlay:
         self.root.configure(bg=BG)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if IS_MAC:
+            try:
+                self.root.createcommand("::tk::mac::ReopenApplication", self._show_window)
+            except Exception as e:
+                log.info("Dock click handler not set: %s", e)
 
         pad = 16
         self._build_tabs()                          # ＋ and past meetings, always on top
@@ -7175,6 +7287,25 @@ class Overlay:
         self._set_answer("", empty=True)
         self.toast(message, seconds=8)
 
+    def _show_window(self, *_):
+        """Bring the window back: minimized (yellow button), hidden (Cmd+H or
+        Hide in the Dock menu) or behind other windows."""
+        try:
+            self.root.deiconify()
+            if IS_MAC:
+                try:
+                    from AppKit import NSApplication
+                    app = NSApplication.sharedApplication()
+                    app.unhide_(None)
+                    app.activateIgnoringOtherApps_(True)
+                except Exception as e:
+                    log.info("Could not unhide Sidenote: %s", e)
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.focus_force()
+        except Exception as e:
+            log.info("Could not show the Sidenote window: %s", e)
+
     def on_close(self):
         """X ends the meeting (after a confirmation if a meeting is in progress)."""
         count, _ = transcript.stats()
@@ -7986,6 +8117,8 @@ class Overlay:
                     self.update_info()
                     if "agenda" in self.visible:
                         self.render_list("agenda")
+                if kind == "show":
+                    self._show_window()
                 if kind == "toast":
                     self.toast(payload, seconds=6)
                 if kind == "lists":
