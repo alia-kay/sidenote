@@ -1232,7 +1232,7 @@ class Transcript:
 SCHEMA_VERSION = 1
 MEETING_EXT = ".meeting.json"
 INDEX_NAME = ".sidenote_index.json"
-INDEX_VERSION = 2               # bump when the cached fields change (cache is rebuilt)
+INDEX_VERSION = 3               # bump when the cached fields change (cache is rebuilt)
 _history_lock = threading.RLock()
 
 
@@ -1545,7 +1545,8 @@ def _index_entry(d, stat):
             "summary_line": line[:200], "imported": d["imported"],
             "action_items": d["action_items"], "decisions": d["decisions"],
             "open_questions": d["open_questions"], "questions_to_ask": d["questions_to_ask"],
-            "agenda": d["agenda"], "lines": len(d["transcript"])}
+            "agenda": d["agenda"], "lines": len(d["transcript"]),
+            "has_summary": bool((d["summary"] or "").strip()), "ended": d.get("ended", True)}
 
 
 def history_index():
@@ -1627,6 +1628,7 @@ class LiveState:
         self.answer_target = "live"  # where show_suggestion goes: live, history, dropped
         self.pending_info = {}      # meeting info given before Record was pressed
         self.record_on_open = False  # open straight into a recording (user asked)
+        self.recap_asked = set()    # past meetings Claude was asked to recap (this run)
 
     def label(self):
         if self.released:
@@ -1982,6 +1984,9 @@ def _lc_wait(win, pred, seconds=3.0):
         time.sleep(0.3)
 
 
+LC_MIC = {"state": ""}      # Windows Live Captions mic: "", "on", "failed"
+
+
 def enable_lc_microphone():
     """Turn on 'Include microphone audio' in Live Captions (it resets on every start).
     Returns 'on', 'already', or an error text."""
@@ -2009,15 +2014,37 @@ def enable_lc_microphone():
         mic = _lc_wait(win, mic_pred)
         if mic is None:
             return "could not find 'Include microphone audio'"
-    try:
-        toggle = mic.GetTogglePattern()
-        if toggle and toggle.ToggleState == 1:
-            result = "already"
-        else:
-            toggle.Toggle() if toggle else _activate(mic)
-            result = "on"
-    except Exception:
-        result = "on" if _activate(mic) else "could not switch the microphone option"
+    def state():
+        try:
+            toggle = mic.GetTogglePattern()
+            return toggle.ToggleState if toggle else None
+        except Exception:
+            return None
+
+    # Read twice before switching: right after the menu opens the state can still
+    # read 'off', and switching then would turn an 'on' microphone OFF.
+    now = state()
+    if now != 1:
+        time.sleep(0.6)
+        now = state()
+    if now == 1:
+        result = "already"
+    elif now is None:                 # no readable state: click once, can't verify
+        result = "on (not verified)" if _activate(mic) else \
+            "could not switch the microphone option"
+    else:
+        # Switch once, then check that it really is on (a second switch could undo
+        # it; a failed check is retried later from a fresh read)
+        try:
+            mic.GetTogglePattern().Toggle()
+        except Exception:
+            _activate(mic)
+        result = "not confirmed: the microphone option still reads off"
+        for _ in range(8):
+            time.sleep(0.25)
+            if state() == 1:
+                result = "on"
+                break
     if opened:          # close the menu again if it is still open
         try:
             settings_again = _lc_find(win, lambda c: c.ControlTypeName in (
@@ -2060,9 +2087,10 @@ class LiveCaptionsReader:
         result = enable_lc_microphone()
         self.mic_tries = {handle: (tries + 1, time.time())}
         log.info("Live Captions microphone: %s (try %d)", result, tries + 1)
-        if result in ("on", "already"):
+        LC_MIC["state"] = "on" if result in ("on", "already", "on (not verified)") else "failed"
+        if result in ("on", "already", "on (not verified)"):
             self.mic_done_for = handle
-        if result == "on":
+        if result.startswith("on"):
             ui_queue.put(("toast", "Turned on your microphone in Live Captions"))
         elif result != "already":
             ui_queue.put(("toast", "Couldn't turn on the mic in Live Captions: " + result))
@@ -2131,7 +2159,7 @@ def meet_key(title):
     return m.group(0) if m else (title or "").lower()
 
 
-SIDENOTE_VERSION = "2026-11-16 v11"
+SIDENOTE_VERSION = "2026-11-17 v12"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -2172,6 +2200,21 @@ class AutoCaptions:
         log.info("Auto captions: %s", auto_cc_status["text"])
         if ok and attempt == 0:
             ui_queue.put(("toast", f"Turning on {self.app} captions"))
+
+
+def _open_menu_button(control):
+    """Press a toggle, a menu button or a plain button, whichever it supports."""
+    for get, act in (("GetTogglePattern", "Toggle"), ("GetExpandCollapsePattern", "Expand"),
+                     ("GetInvokePattern", "Invoke")):
+        try:
+            pattern = getattr(control, get)()
+        except Exception:
+            pattern = None
+        if pattern is not None:
+            getattr(pattern, act)()
+            return act
+    control.GetLegacyIAccessiblePattern().DoDefaultAction()
+    return "default action"
 
 
 class MeetReader:
@@ -2248,7 +2291,17 @@ class MeetReader:
                 return "box" if pattern.ToggleState == auto.ToggleState.Off else None
             except Exception:
                 return None
-        return "button" if name.startswith("turn on") else None
+        if name.startswith("turn on"):
+            return "button"
+        # Meet since Nov 2026: 'Captions and translation' opens a small menu that
+        # holds 'Turn on captions'. It has no on/off state, only expand/collapse.
+        if not name.startswith(("turn off", "hide")):
+            try:
+                if control.GetExpandCollapsePattern() is not None:
+                    return "box"
+            except Exception:
+                pass
+        return None
 
     def _find_cc_button(self, win):
         for control, _ in _walk(win, 40):
@@ -2272,11 +2325,7 @@ class MeetReader:
         try:
             button = self.cc_btn
             if button is None:
-                pattern = self.cc_box.GetTogglePattern()
-                if pattern is not None:
-                    pattern.Toggle()
-                else:
-                    self.cc_box.GetInvokePattern().Invoke()
+                _open_menu_button(self.cc_box)
                 how = "menu+"
                 for _ in range(10):                 # wait for the menu, up to 2 s
                     time.sleep(0.2)
@@ -2290,6 +2339,13 @@ class MeetReader:
                 how += "no button"
         except Exception as e:
             log.info("Could not press Meet captions: %s", e)
+        if self.cc_box is not None:                  # leave no menu open
+            try:
+                pattern = self.cc_box.GetExpandCollapsePattern()
+                if pattern is not None and pattern.ExpandCollapseState == 1:
+                    pattern.Collapse()
+            except Exception:
+                pass
         self.auto.pressed(key, attempt, how, ok)
 
     def _blocks(self):
@@ -2468,7 +2524,7 @@ class MacMeetReader:
         """'box': Meet's captions toggle, now off. 'button': a "Turn on
         captions" button. None: anything else."""
         role = ax(el, "AXRole")
-        if role not in ("AXCheckBox", "AXButton"):
+        if role not in ("AXCheckBox", "AXButton", "AXPopUpButton", "AXMenuButton"):
             return None
         label = (str(ax(el, "AXTitle") or "") + " " +
                  str(ax(el, "AXDescription") or "")).lower().strip()
@@ -2476,7 +2532,16 @@ class MacMeetReader:
             return None
         if role == "AXCheckBox":
             return "box" if str(ax(el, "AXValue")) in ("0", "False") else None
-        return "button" if label.startswith("turn on") else None
+        if label.startswith("turn on"):
+            return "button"
+        # Meet since Nov 2026: 'Captions and translation' opens a menu that holds
+        # 'Turn on captions' (a pop-up button, or a button with AXExpanded)
+        if not label.startswith(("turn off", "hide")):
+            expanded = ax(el, "AXExpanded")
+            if role in ("AXPopUpButton", "AXMenuButton") or expanded is not None:
+                if str(expanded) not in ("1", "True"):
+                    return "box"
+        return None
 
     def _find_cc_button(self, win):
         for el, _ in ax_walk(win, 60):
@@ -4248,6 +4313,11 @@ def core_wait_for_question(timeout_seconds=WAIT_DEFAULT_SECONDS):
                 "wait_for_question. Tell the user in one short line that Sidenote is idle and "
                 "that typing 'open Sidenote' starts the next meeting.")
     live.released = False
+    if live.mode != "record" and question_queue.empty():
+        task = _recap_task()
+        if task:
+            live.last_seen = time.time()
+            return task
     live.waiting = True
     live.last_seen = time.time()
     try:
@@ -4430,7 +4500,12 @@ def _by_person_complete(text):
     return "\n".join(out).strip()
 
 
-def core_save_recap(recap="", summary="", by_person="", decisions="", open_questions=""):
+def core_save_recap(recap="", summary="", by_person="", decisions="", open_questions="",
+                    meeting_id=""):
+    meeting_id = str(meeting_id or "").strip()
+    if meeting_id and meeting_id != transcript.meeting_id:
+        return save_past_recap(meeting_id, (summary or recap or "").strip(), by_person,
+                               decisions, open_questions)
     summary = (summary or recap or "").strip()
     by_person = _by_person_complete(by_person)
     with transcript.lock:
@@ -4446,6 +4521,122 @@ def core_save_recap(recap="", summary="", by_person="", decisions="", open_quest
     shown = summary + (f"\n\n{by_person}" if by_person else "")
     ui_queue.put(("recap", real_dates(shown, transcript.started)))
     return f"Recap saved in {transcript.file_path}"
+
+
+# --- recaps for meetings that ended without one ------------------------------------
+# Closing the window (or Claude not being connected) can end a meeting before Claude
+# writes its recap. Whenever Sidenote is open again and Claude is listening, it asks
+# Claude to write the missing ones (meetings of the last RECAP_LATER_DAYS days).
+RECAP_LATER_DAYS = 14
+RECAP_LATER_MIN_LINES = 10          # shorter recordings are tests or false starts
+TXT_SECTIONS = ("SUMMARY", "BY PERSON", "DECISIONS", "ACTION ITEMS", "OPEN QUESTIONS",
+                "CONTEXT", "TRANSCRIPT")
+
+
+def missing_recaps():
+    since = (datetime.date.today() - datetime.timedelta(days=RECAP_LATER_DAYS)).isoformat()
+    try:
+        entries = history_index()
+    except Exception:
+        return []
+    return [e for e in entries
+            if not e.get("has_summary", True) and not e["imported"]
+            and e["lines"] >= RECAP_LATER_MIN_LINES and e["date"] >= since
+            and e["id"] != transcript.meeting_id]
+
+
+def _recap_task():
+    """A missing recap to ask Claude for (one per wait_for_question call), or None."""
+    for e in missing_recaps():
+        if e["id"] in live.recap_asked:
+            continue
+        live.recap_asked.add(e["id"])
+        when = fmt_day_iso(e["date"]) + (f", {e['start']}" if e["start"] else "")
+        return (
+            f"TASK (no question from the user): the meeting \u201c{e['title']}\u201d ({when}, "
+            f"id {e['id']}) ended without a recap (the window was closed first). Write it now: "
+            f"call get_meeting(meeting_id=\"{e['id']}\", include_transcript=true), then save the "
+            f"recap with save_recap(meeting_id=\"{e['id']}\", summary, by_person, decisions, "
+            "open_questions), exactly as for a live meeting (see the save_recap description; "
+            "action items are already saved, don't repeat them). Don't answer in the chat beyond "
+            "one short line. Then call wait_for_question again.")
+    return None
+
+
+def _rows(text):
+    return [re.sub(r"^\s*[-*\u2022]\s*", "", l).strip()
+            for l in (text or "").splitlines() if l.strip()]
+
+
+def _replace_txt_section(text, header, body):
+    """Replace one section of a meeting .txt (the header line, its body, a blank line)."""
+    lines = text.split("\n")
+    try:
+        i = lines.index(header)
+    except ValueError:
+        return text
+    j = i + 1
+    while j < len(lines) and lines[j] not in TXT_SECTIONS:
+        j += 1
+    return "\n".join(lines[:i + 1] + [body.strip(), ""] + lines[j:])
+
+
+def save_past_recap(meeting_id, summary, by_person, decisions, open_questions):
+    """Add the recap to a past meeting: its meeting.json and its .txt."""
+    e = find_meeting(meeting_id)
+    if e is None:
+        return f"No meeting with id {meeting_id}. Use list_meetings to see ids."
+    if not summary:
+        return "Not saved: the summary is empty."
+    me = profile.name
+    lines_bp = []
+    for line in (by_person or "").strip().splitlines():
+        m = re.match(r"^(\s*[-*\u2022]?\s*)(You|Me)(\s*[:\-\u2013])", line)
+        lines_bp.append(m.group(1) + me + line[m.end(2):] if m and me else line.rstrip())
+    by_person = "\n".join(lines_bp).strip()
+    with _history_lock:
+        d = load_meeting(e["path"])
+        path = d.pop("_path")
+        d["summary"] = summary
+        d["by_person"] = []
+        for line in _rows(by_person):
+            who, sep, said = line.partition(":")
+            d["by_person"].append({"name": who.strip(), "text": said.strip()}
+                                  if sep and len(who) <= 60 else {"name": "", "text": line})
+        if decisions.strip():
+            d["decisions"] = [{"id": f"d{i}", "text": x}
+                              for i, x in enumerate(_rows(decisions), 1)]
+        if open_questions.strip():
+            old = {q["text"]: q.get("status", "open") for q in d["open_questions"]}
+            d["open_questions"] = [{"id": f"q{i}", "text": x, "status": old.get(x, "open")}
+                                   for i, x in enumerate(_rows(open_questions), 1)]
+        d["recap_saved_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        _write_json(path, d)
+        txt = path[:-len(MEETING_EXT)] + ".txt" if path.endswith(MEETING_EXT) else ""
+        if txt and os.path.exists(txt):              # (only files Sidenote wrote itself)
+            try:
+                with open(txt, encoding="utf-8") as f:
+                    text = f.read()
+                text = _replace_txt_section(text, "SUMMARY", summary)
+                text = _replace_txt_section(text, "BY PERSON", by_person)
+                if decisions.strip():
+                    text = _replace_txt_section(
+                        text, "DECISIONS", "\n".join(f"- {x}" for x in _rows(decisions)))
+                if open_questions.strip():
+                    asked = [q for q in d["questions_to_ask"] if not q.get("asked")]
+                    text = _replace_txt_section(text, "OPEN QUESTIONS", "\n".join(
+                        [f"- {x}" for x in _rows(open_questions)]
+                        + [f"- [ ] {q['text']}" for q in asked]))
+                tmp = txt + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.replace(tmp, txt)
+            except OSError as ex:
+                log.warning("Could not update %s: %s", txt, ex)
+    live.recap_asked.add(meeting_id)
+    ui_queue.put(("history_changed", meeting_id))
+    ui_queue.put(("toast", f"Recap added to \u201c{e['title']}\u201d"))
+    return f"Recap saved in \u201c{e['title']}\u201d ({fmt_day_iso(e['date'])}): {txt or path}"
 
 
 # --- History (past meetings), read straight from Documents/Sidenote ---------------
@@ -5026,7 +5217,7 @@ async def add_context_item(title: str, source: str = "", detail: str = "",
 
 @mcp.tool()
 async def save_recap(summary: str = "", by_person: str = "", decisions: str = "",
-                     open_questions: str = "", recap: str = "") -> str:
+                     open_questions: str = "", recap: str = "", meeting_id: str = "") -> str:
     """Save the meeting recap into the meeting file, in parts. Sidenote writes the
     Action items, the To-ask questions and the Context list itself: never repeat
     them here.
@@ -5037,9 +5228,12 @@ async def save_recap(summary: str = "", by_person: str = "", decisions: str = ""
     decisions: one per line, '- ...'.
     open_questions: unresolved questions and open debates, one per line. A debate:
     '- Topic: Name1 wants X; Name2 wants Y (no conclusion)'.
-    Use real names, never 'You'/'you' for a person. recap: old single-text form."""
+    Use real names, never 'You'/'you' for a person. recap: old single-text form.
+    meeting_id: only for a past meeting that ended without a recap (Sidenote asks
+    for it with a TASK); leave it empty for the current meeting."""
     return await run("save_recap", summary=summary, by_person=by_person,
-                     decisions=decisions, open_questions=open_questions, recap=recap)
+                     decisions=decisions, open_questions=open_questions, recap=recap,
+                     meeting_id=meeting_id)
 
 
 @mcp.tool()
@@ -7021,6 +7215,11 @@ class Overlay:
         if captions_win.note:
             return "Live Captions is docked: set it to 'Floating on screen'", WARN
         label = LC_SHORT
+        if not IS_MAC and LC_MIC["state"] == "on":
+            label += " + your mic"
+        elif not IS_MAC and LC_MIC["state"] == "failed":
+            return ("Your mic may be off · Live Captions > Settings > Preferences > "
+                    "Include microphone audio"), WARN
         if IS_MAC:
             if mic.status == "on":
                 label += " + your mic"

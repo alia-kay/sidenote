@@ -1,5 +1,5 @@
 SIDENOTE - TESTER GUIDE (Mac)
-Version 2026-11-16 v11
+Version 2026-11-17 v12
 
 Sidenote is a small window that sits next to your meeting. It reads the
 meeting captions and lets you ask Claude about the meeting while it happens.
@@ -7,7 +7,7 @@ Meeting notes are saved only on your Mac, in Documents/Sidenote.
 
 You need: a Mac with the latest macOS, Google Chrome, the Claude desktop app
 (signed in), an internet connection, and the file
-Sidenote-2026-11-16-v11.mcpb.
+Sidenote-2026-11-17-v12.mcpb.
 
 
 BEFORE YOU START
@@ -18,7 +18,7 @@ BEFORE YOU START
 
 INSTALL
 
-2. Double-click Sidenote-2026-11-16-v11.mcpb. Claude opens and shows the
+2. Double-click Sidenote-2026-11-17-v12.mcpb. Claude opens and shows the
    Sidenote extension. Click Install.
    (Or open Claude > Settings > Extensions and drag the file into the window.)
 
@@ -56,8 +56,14 @@ TRY IT IN A GOOGLE MEET CALL
 8. Join a Google Meet call in Chrome (a call with a friend or colleague,
    or a test call on your own). In the Sidenote window click "Start
    meeting", then talk for a few minutes.
-   - Turn on captions in Meet (the CC button). Sidenote tries to turn them
-     on by itself.
+   - Don't turn on Meet's captions yourself: within about 10 seconds
+     Sidenote turns them on by itself (Meet's "Captions and translation"
+     button > "Turn on captions"), and the bottom line says "Google Meet
+     captions". NEW IN v12, please check this one.
+     If nothing happens after 20 seconds, type in the Claude chat:
+     save the Meet window structure  and send me the file it saves
+     (Documents/Sidenote/debug_meet_tree.txt). Then turn captions on
+     yourself to continue.
    - Ask Claude something in the box at the bottom of the Sidenote window,
      for example "What should I ask now?". Your question and Claude's
      answer appear at the top; older ones are below (scroll down).
@@ -113,7 +119,14 @@ TRY IT IN A GOOGLE MEET CALL
      nothing from other windows.
 
 
-8e. Past meetings (the clock icon at the top):
+8e. A meeting closed before its recap (NEW IN v12):
+   - Record a short meeting (talk for 2-3 minutes), then close the
+     Sidenote window with the red button instead of "End meeting".
+   - Type "open Sidenote" in a Claude chat. Within a minute Claude writes
+     the missing recap by itself and says so in one line. Check it on the
+     clock tab (the meeting now has a Summary).
+
+8f. Past meetings (the clock icon at the top):
    - After a meeting or two, click the clock icon. Pick a meeting on the
      left, tick an action item, and ask in the box at the bottom: "What are
      my open action items?". Then close the Sidenote window and ask the same
@@ -124,7 +137,7 @@ CHECK THE VERSION
 
 9. In the Claude chat, ask:
        What's Sidenote's status?
-   The answer ends with "Version: 2026-11-16 v11". The Sidenote window title
+   The answer ends with "Version: 2026-11-17 v12". The Sidenote window title
    shows the same version.
 
 
@@ -138,6 +151,8 @@ IF THE SIDENOTE WINDOW DOES NOT APPEAR
     "open Sidenote" in a chat.
     If it still does not appear, take a screenshot of the Claude chat and
     send it to me.
+    (If you made Tcl/Tk links for an earlier version: v12 no longer needs
+    them. You can leave them or delete them.)
 
 
 UNINSTALL
