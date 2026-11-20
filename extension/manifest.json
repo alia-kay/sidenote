@@ -49,6 +49,8 @@
     {"name": "start_new_meeting", "description": "Save the current meeting and start a new one."},
     {"name": "list_meetings", "description": "List saved meetings (works when the window is closed)."},
     {"name": "get_meeting", "description": "One saved meeting: recap, decisions, questions, action items."},
+    {"name": "save_clean_transcript", "description": "Save a cleaned version of a meeting transcript next to the raw one."},
+    {"name": "add_vocabulary", "description": "Add a name or term the captions get wrong to your vocabulary."},
     {"name": "find_items", "description": "Search action items, decisions and questions across meetings."},
     {"name": "search_transcripts", "description": "Search what was said in saved meetings (snippets)."},
     {"name": "update_item", "description": "Change the status of a saved item (only when the user asks)."},

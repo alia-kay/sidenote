@@ -76,6 +76,15 @@ How it works: Sidenote is a local MCP server for the Claude desktop app, on Wind
 - After "End meeting", Sidenote stays ready for 15 minutes in case you start a new meeting from the window, then goes idle.
 - New meeting (⋯ menu) saves the current meeting and starts a clean one.
 
+## Transcript quality
+
+- Google Meet and Teams: each caption block on screen is one turn. Meet keeps rewriting the last seconds of a block, moves sentence breaks and shows only the end of a long block; Sidenote merges every new view into the turn's full text and saves a sentence only once it has stopped changing (1.5 s), so each sentence is saved once, in its final wording, in order, under the block's speaker name. Unfinished last words are saved when someone else has started talking (added to that speaker's last line) or when the block leaves the screen.
+- Old caption text drawn again (Meet redraws old blocks now and then): a new block of 4+ words that matches, or sits inside, an earlier turn of the same speaker is skipped. Shorter lines ("Yeah.") are always kept. Live Captions and Zoom: a 6+ word line 85% the same as one from the same speaker at least 30 s earlier is skipped. When in doubt, a line is kept.
+- Vocabulary: Documents/Sidenote/vocabulary.txt (⋯ menu > Names and terms, or ask Claude to add one). 'heard => Right' corrects new caption lines (whole words, any capitals); a word alone only tells Claude the right spelling. Saved meetings are not changed.
+- Cleaned transcript, on request ("clean the transcript", or "Clean up with Claude" under Transcript in Past meetings): Claude removes repeats and partial lines, fixes punctuation and names, and marks possible echoes. It is saved next to the raw transcript (meeting.json transcript_clean, and a CLEANED TRANSCRIPT section in the .txt); the raw transcript is never changed.
+- Speaker names come from Meet and Teams (each person's own audio). Live Captions has no names (on Mac, the user's mic is labelled with their name and Live Captions is everyone else). If the user's mic picks up the other person through the speakers, Meet may caption it under the user's name; this can't be detected for sure, so such lines are kept and marked in the cleaned transcript.
+- Raw captions (⋯ menu > Save raw captions, for testing): every change the captions show is saved in Documents/Sidenote/raw captions/<meeting id>.jsonl, to turn a real meeting into a test case.
+
 ## Saved files
 
 - Each meeting is saved automatically in Documents/Sidenote as a readable text file and, next to it, a <same name>.meeting.json (schema_version 1): meeting info, summary, by person, decisions, open questions, action items (id, owner, real due date, status, where they came from, who closed them and why), questions to ask, context and the transcript with timestamps. One self-contained file per meeting; a small cache (.sidenote_index.json) keeps Past meetings fast and is rebuilt automatically.
@@ -92,7 +101,7 @@ How it works: Sidenote is a local MCP server for the Claude desktop app, on Wind
 
 ## Tools Claude can use (MCP)
 
-open_sidenote, close_sidenote, wait_for_question, show_suggestion, update_meeting_info, add_agenda_items, add_participants, add_action_item, add_questions_to_ask, mark_done, set_context_sources, add_context_item, save_recap, get_recent_transcript, get_full_transcript, get_meeting_context, start_new_meeting, get_status (shows the source, line count, auto-captions activity and version), list_meetings, get_meeting, find_items, search_transcripts, update_item, debug_meet_tree, debug_call_window, debug_live_captions_tree.
+open_sidenote, close_sidenote, wait_for_question, show_suggestion, update_meeting_info, add_agenda_items, add_participants, add_action_item, add_questions_to_ask, mark_done, set_context_sources, add_context_item, save_recap, get_recent_transcript, get_full_transcript, get_meeting_context, start_new_meeting, get_status (shows the source, line count, auto-captions activity and version), list_meetings, get_meeting, find_items, search_transcripts, update_item, save_clean_transcript, add_vocabulary, debug_meet_tree, debug_call_window, debug_live_captions_tree.
 
 ## Technical notes
 

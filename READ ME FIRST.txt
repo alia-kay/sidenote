@@ -94,6 +94,11 @@ You need: a Mac, the Claude desktop app (signed in), and Python 3.10 or newer.
      questions. The transcript is folded away; click "Show ... lines".
    - Tick an action item to mark it done (untick to reopen). This works even
      when Claude isn't connected.
+   - Under Transcript, "Clean up with Claude" makes a cleaned version (repeats
+     removed, punctuation and names fixed). The original stays: "Show ... raw
+     lines".
+   - Names the captions get wrong: ... menu > Names and terms. One per line,
+     e.g. "Jonas => Janus". New captions use it right away.
    - Ask Claude in the box at the bottom: about the meeting you selected, or
      about all of them when "All meetings" is selected, e.g. "What are my open
      action items from the last two weeks?". Claude always says which meeting

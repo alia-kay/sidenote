@@ -165,7 +165,8 @@ def parse_list(value, commas=True):
         if "\n" in text or ";" in text or not commas:
             items = re.split(r"\n|;", text)
         else:
-            items = text.split(",")
+            # 'Janus (CTO, Pixelz), Carlos': no split inside brackets
+            items = re.split(r",(?![^()\[\]]*[)\]])", text)
     out = []
     for item in items:
         item = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s*", "", str(item)).strip()
@@ -439,7 +440,8 @@ EMPTY_CONTEXT = {"title": "", "subject": "", "role": "", "goals": "",
                  "agenda_done": [],  # agenda items already covered (their text)
                  "actions": [],      # [{"text", "owner", "due", "done"}]
                  "questions": [],    # [{"text", "done"}]
-                 "context": []}      # [{"title", "source", "detail", "url"}]
+                 "context": [],      # [{"title", "source", "detail", "url"}]
+                 "clean_transcript": ""}  # cleaned by Claude after the meeting (raw kept)
 
 
 # Jira/Confluence context list (merged from sidenote_context_patch.py)
@@ -451,6 +453,193 @@ MAX_PER_TOPIC = 2           # mid-meeting adds per new topic
 def _same(a, b):
     return norm(a) == norm(b) or (len(norm(a)) > 12 and norm(a) in norm(b)) or \
         (len(norm(b)) > 12 and norm(b) in norm(a))
+
+
+# ---------------------------------------------------------------------------
+# Caption turns (Google Meet, Teams): each caption block on screen is one turn
+# ---------------------------------------------------------------------------
+# Meet and Teams keep rewriting the last seconds of a block, move sentence breaks,
+# and show only the end of a long block. Sidenote keeps each block's full text,
+# merges every new view of it into that text, and saves a sentence only once it
+# has stopped changing, so each sentence is saved once, in its final wording.
+TURN_STABLE_SECONDS = 1.5      # a finished sentence is saved once unchanged this long
+TURN_CLOSE_SECONDS = 4.0       # a block gone from screen this long: its turn is finished
+TURN_FORCE_SENTENCES = 3       # this many finished sentences waiting: save the first anyway
+TURN_REOPEN_SECONDS = 30       # a finished block seen again within this: the same turn
+TURN_DONE_SECONDS = 1.5        # a newer turn exists and this one is unchanged this long
+                               # (as long as a sentence waits: keeps who-said-what in order)
+GHOST_MIN_WORDS = 4            # an old block redrawn later (4+ words, same speaker)...
+GHOST_SIMILARITY = 0.85        # ...this similar to, or inside, an earlier turn: skipped
+LINE_GHOST_WORDS = 6           # Live Captions/Zoom: fuzzy re-read check from this length
+LINE_GHOST_MIN_AGE = 30        # ...against lines at least this old
+SENTENCE_END = re.compile(r"[.!?\u2026][\"'\u201d)\]]*$")
+
+
+def _clock():
+    """Seconds, for caption turns (tests replace it to move time forward)."""
+    return time.time()
+
+
+def _wn(token):
+    """A caption word, compared without case and punctuation."""
+    return re.sub(r"[^\w]", "", token.lower())
+
+
+class CaptionTurn:
+    _count = 0
+
+    def __init__(self, speaker, now):
+        CaptionTurn._count += 1
+        self.n = CaptionTurn._count     # creation order
+        self.speaker = speaker
+        self.toks = []                  # the full text so far, as words
+        self.done = 0                   # words already saved
+        self.raw = ""                   # the block text as last seen
+        self.seen = now                 # last time on screen
+        self.changed = now              # last time its text changed
+        self.stable = []                # [(sentence words, since)] finished, not saved yet
+        self.closed = False
+        self.last_entry = None          # index of its last saved line
+
+    def norm(self):
+        return [_wn(t) for t in self.toks]
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary: names and terms the captions get wrong (Documents/Sidenote/vocabulary.txt)
+# ---------------------------------------------------------------------------
+VOCAB_NAME = "vocabulary.txt"
+VOCAB_DEFAULT = """# Sidenote vocabulary: names and terms the captions often get wrong.
+# One per line. Edit and save; Sidenote picks up the changes right away.
+#
+#   heard => Right   fixes what the captions write, in every new line saved
+#                    (whole words, any capitals: 'Pixels => Pixelz' also turns
+#                    the ordinary word 'pixels' into 'Pixelz')
+#   Right            only tells Claude the right spelling (recaps, cleaned
+#                    transcripts)
+#
+# Lines starting with # are notes. Saved meetings are not changed.
+
+Pixels => Pixelz
+yamos => Janus
+Marina => Mariana
+Carlos
+"""
+_vocab = {"path": None, "mtime": None, "rules": [], "terms": []}
+
+
+def vocab_path():
+    return os.path.join(SAVE_DIR, VOCAB_NAME)
+
+
+def vocabulary():
+    """(rules, terms): rules = [(compiled pattern, right)], terms = right spellings."""
+    path = vocab_path()
+    try:
+        if not os.path.exists(path):
+            os.makedirs(SAVE_DIR, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(VOCAB_DEFAULT)
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return [], []
+    if _vocab["path"] == path and _vocab["mtime"] == mtime:
+        return _vocab["rules"], _vocab["terms"]
+    rules, terms = [], []
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        heard, sep, right = line.partition("=>")
+        heard, right = heard.strip(), right.strip()
+        if sep and heard and right:
+            rules.append((re.compile(r"(?<!\w)" + re.escape(heard) + r"(?!\w)", re.IGNORECASE),
+                          right))
+            term = right
+        else:
+            term = heard
+        if term and term not in terms:
+            terms.append(term)
+    _vocab.update(path=path, mtime=mtime, rules=rules, terms=terms)
+    return rules, terms
+
+
+def apply_vocabulary(text):
+    try:
+        rules, _ = vocabulary()
+    except Exception:
+        return text
+    for pattern, right in rules:
+        text = pattern.sub(right, text)
+    return text
+
+
+def vocabulary_note():
+    try:
+        _, terms = vocabulary()
+    except Exception:
+        terms = []
+    return ("Names and terms (right spelling, from the user's vocabulary): " + ", ".join(terms)
+            ) if terms else ""
+
+
+def core_add_vocabulary(term, heard_as=""):
+    term, heard_as = " ".join(str(term or "").split()), " ".join(str(heard_as or "").split())
+    if not term:
+        return "Give the right spelling (term)."
+    vocabulary()                                      # creates the file if needed
+    line = f"{heard_as} => {term}" if heard_as else term
+    try:
+        with open(vocab_path(), encoding="utf-8") as f:
+            existing = [l.strip().lower() for l in f.read().splitlines()]
+        if line.lower() in existing:
+            return f"Already in the vocabulary: {line}"
+        with open(vocab_path(), "a", encoding="utf-8") as f:
+            f.write(("" if not existing or existing[-1] == "" else "\n") + line + "\n")
+    except OSError as e:
+        return f"Could not write the vocabulary: {e}"
+    return (f"Added to the vocabulary: {line}. "
+            + ("New captions use it from now on (saved meetings are not changed)."
+               if heard_as else "Claude uses this spelling in recaps and cleaned transcripts."))
+
+
+# ---------------------------------------------------------------------------
+# Raw captions (optional, for testing): every change the captions show, as read
+# ---------------------------------------------------------------------------
+RAW_FLAG = ".save_raw_captions"
+_raw_state = {"checked": 0.0, "on": False}
+
+
+def raw_capture_on(refresh=False):
+    if refresh or time.time() - _raw_state["checked"] > 5:
+        _raw_state.update(checked=time.time(),
+                          on=os.path.exists(os.path.join(SAVE_DIR, RAW_FLAG)))
+    return _raw_state["on"]
+
+
+def raw_capture_folder():
+    return os.path.join(SAVE_DIR, "raw captions")
+
+
+def _raw_capture(tr, kind, payload):
+    """Append one read to raw captions/<meeting id>.jsonl, when it changed."""
+    if not raw_capture_on() or payload == getattr(tr, "_raw_last", None):
+        return
+    tr._raw_last = payload
+    try:
+        import json
+        os.makedirs(raw_capture_folder(), exist_ok=True)
+        with open(os.path.join(raw_capture_folder(), f"{tr.meeting_id}.jsonl"), "a",
+                  encoding="utf-8") as f:
+            f.write(json.dumps({"t": round(time.time(), 2), "source": tr.source, kind: payload},
+                               ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 class Transcript:
@@ -483,6 +672,9 @@ class Transcript:
         self.entries = []                 # list of (datetime, sentence)
         self.recent = deque(maxlen=400)   # normalized recent sentences
         self.recent_words = deque(maxlen=300)  # [datetime, speaker, words, entry index]
+        self.turns = []                   # CaptionTurn: Meet/Teams caption blocks
+        self._ghosts = set()              # redrawn old blocks already recognised
+        self._ghost_logged = False
         self.last_final = None            # last sentence committed (raw)
         self.pending = ""                 # sentence still being spoken
         self.started = datetime.datetime.now()
@@ -747,6 +939,8 @@ class Transcript:
     # --- captions --------------------------------------------------------
     def end_meeting(self):
         with self.lock:
+            if self.turns and not self.ended_at:
+                self._settle_turns(_clock(), set(), force=True)
             if not self.ended_at:
                 self.ended_at = datetime.datetime.now()
                 self.entries.append((self.ended_at, "MEETING ENDED"))
@@ -762,6 +956,10 @@ class Transcript:
         text = " ".join(raw_text.split())
         if not text:
             return
+        with self.lock:
+            _raw_capture(self, "text", [speaker, text])
+            if self.turns:
+                self._settle_turns(_clock(), set())      # Meet/Teams turns left open
         parts = SENTENCE_SPLIT.split(text)
         finals, pending = (parts, "") if final else (parts[:-1], parts[-1])
 
@@ -812,7 +1010,7 @@ class Transcript:
             for sentence in SENTENCE_SPLIT.split(text):
                 k = norm(speaker + sentence)
                 if norm(sentence) and k not in self.recent:
-                    self._commit(now, f"{speaker}: {sentence}", k, speaker)
+                    self._commit(now, f"{speaker}: {sentence}", k, speaker)   # (vocabulary inside)
                     self._note_cues(sentence)
         return True
 
@@ -872,6 +1070,20 @@ class Transcript:
         self._replay_at = now
         return True
 
+    def _is_line_ghost(self, now, speaker, words):
+        """A 6+ word line almost the same (85%) as one from the same speaker at
+        least 30 s ago: old caption text read again, slightly changed."""
+        if len(words) < LINE_GHOST_WORDS:
+            return False
+        for t, spk, prev, _ in self.recent_words:
+            if spk != speaker or (now - t).total_seconds() < LINE_GHOST_MIN_AGE or \
+                    not 0.6 <= len(words) / max(1, len(prev)) <= 1.7:
+                continue
+            if difflib.SequenceMatcher(None, prev, words, autojunk=False).ratio() >= GHOST_SIMILARITY:
+                self.replay_skipped += 1
+                return True
+        return False
+
     def _check_batch(self, now, speaker, sentences):
         """A batch of new caption lines that is mostly lines we already have is a
         replay as a whole, so its short lines ('Okay.', 'Hi.') are skipped too."""
@@ -897,9 +1109,12 @@ class Transcript:
         again from the captions buffer are skipped."""
         sentence = line[len(speaker) + 2:] if speaker else line
         words = tuple(re.findall(r"\w+", sentence.lower()))
-        if self._is_repeat(now, speaker, words) or self._is_replay(now, speaker, words):
+        if self._is_repeat(now, speaker, words) or self._is_replay(now, speaker, words) \
+                or self._is_line_ghost(now, speaker, words):
             self.recent.append(key)
             return False
+        sentence = apply_vocabulary(sentence)
+        line = f"{speaker}: {sentence}" if speaker else sentence
         self._remember(speaker, words)
         rec = self._find_revision(now, speaker, words)
         if rec is not None and rec[3] < len(self.entries):
@@ -932,36 +1147,211 @@ class Transcript:
         return True
 
     def ingest_blocks(self, blocks):
-        """Speaker-labelled captions (Google Meet): blocks = [(speaker, text), ...],
-        oldest first. Finished sentences are committed as 'Speaker: sentence'."""
-        if self.ended_at or not blocks:
+        """Speaker-labelled captions (Google Meet, Teams): blocks = [(speaker, text),
+        ...] as on screen, oldest first. Each block is a turn (see CaptionTurn):
+        its finished sentences are saved once they stop changing."""
+        if self.ended_at:
             return
-        now = datetime.datetime.now()
+        now = _clock()
+        blocks = [(spk or "", " ".join(str(text).split())) for spk, text in (blocks or [])]
+        blocks = [(spk, text) for spk, text in blocks if text]
         with self.lock:
+            _raw_capture(self, "blocks", blocks)
             if self.skip_visible:          # captions from before this meeting started
                 self.skip_visible = False
                 for speaker, text in blocks:
-                    for sentence in SENTENCE_SPLIT.split(" ".join(text.split())):
+                    turn = CaptionTurn(speaker, now)
+                    turn.toks = text.split(" ")
+                    turn.raw, turn.done = text, len(turn.toks)
+                    self.turns.append(turn)
+                    for sentence in SENTENCE_SPLIT.split(text):
                         self.recent.append(norm(speaker + sentence))
                         self.recent.append(norm(sentence))
                 return
-            pending = ""
-            for i, (speaker, text) in enumerate(blocks):
-                text = " ".join(text.split())
-                if not text:
-                    continue
-                parts = SENTENCE_SPLIT.split(text)
-                last_block = i == len(blocks) - 1
-                finals = parts if not last_block else parts[:-1]
-                if last_block:
-                    pending = f"{speaker}: {parts[-1]}" if speaker else parts[-1]
-                for sentence in finals:
-                    key = norm(speaker + sentence)
-                    if not norm(sentence) or key in self.recent:
+            used, after, latest = set(), 0, None
+            for speaker, text in blocks:
+                turn = self._match_turn(speaker, text, now, used, after)
+                if turn is None:
+                    if self._is_ghost(speaker, text, now):
                         continue
-                    self._commit(now, f"{speaker}: {sentence}" if speaker else sentence, key, speaker)
-                    self._note_cues(sentence)
-            self.pending = pending
+                    turn = CaptionTurn(speaker, now)
+                    self.turns.append(turn)
+                used.add(turn.n)
+                after = max(after, turn.n)
+                self._update_turn(turn, text, now)
+                latest = turn
+            self._settle_turns(now, used)
+            if latest is not None:
+                rest = " ".join(latest.toks[latest.done:])
+                self.pending = (f"{latest.speaker}: {rest}" if latest.speaker else rest) \
+                    if rest else ""
+            elif not blocks:
+                self.pending = ""
+
+    def _match_turn(self, speaker, text, now, used, after):
+        """The turn this block belongs to: the same text as last time, or the
+        same words (a longer, revised or cut-off view of it)."""
+        recent = [t for t in self.turns[-60:] if t.speaker == speaker and t.n not in used
+                  and t.n > after and (not t.closed or now - t.seen <= TURN_REOPEN_SECONDS)]
+        for t in reversed(recent):
+            if t.raw == text:
+                return t
+        words = [w for w in (_wn(x) for x in text.split(" "))]
+        best, best_score = None, 0.0
+        for t in recent:
+            tail = t.norm()[-(len(words) + 30):]
+            if not tail or not words:
+                continue
+            matched = sum(m.size for m in difflib.SequenceMatcher(
+                None, tail, words, autojunk=False).get_matching_blocks())
+            if matched < min(2, len(words), len(tail)):
+                continue
+            score = matched / min(len(words), len(tail))
+            if score >= 0.5 and score >= best_score:
+                best, best_score = t, score
+        return best
+
+    def _update_turn(self, turn, text, now):
+        """Merge the block as seen now into the turn's full text. The block may
+        show only the end of a long turn, and may have rewritten its last words."""
+        turn.seen, turn.closed = now, False
+        if text == turn.raw:
+            return
+        new = text.split(" ")
+        if not turn.toks:
+            turn.toks, turn.raw, turn.changed = new, text, now
+            return
+        old_n, new_n = turn.norm(), [_wn(x) for x in new]
+        blocks = [m for m in difflib.SequenceMatcher(
+            None, old_n, new_n, autojunk=False).get_matching_blocks() if m.size]
+        if not blocks:
+            return                                   # unrelated: keep what we have
+        first = next((m for m in blocks if m.size >= 2), blocks[0])
+        start = first.a - first.b                    # where the block starts in our text
+        if start < 0:
+            # the block starts before our text: it is a fuller view of the turn
+            if sum(m.size for m in blocks) >= 0.6 * len(old_n) and turn.done == 0:
+                turn.toks, turn.raw, turn.changed = new, text, now
+            return
+        tail = len(old_n) - start
+        covered = sum(m.size for m in blocks if m.a >= start)
+        if len(new) < 0.8 * tail and covered < 0.6 * tail:
+            return                                   # an older, shorter view: nothing new
+        if start < turn.done:
+            # words already saved stay as saved; take the block from there on
+            offset = 0
+            for m in blocks:
+                if m.a < turn.done:
+                    offset = m.b - m.a
+            cut = max(0, min(len(new), turn.done + offset))
+            merged = turn.toks[:turn.done] + new[cut:]
+        else:
+            merged = turn.toks[:start] + new
+        if merged != turn.toks:
+            turn.toks, turn.changed = merged, now
+        turn.raw = text
+
+    def _is_ghost(self, speaker, text, now):
+        """An old caption block drawn again (Meet does this now and then): 4+ words
+        that match, or sit inside, a turn of the same speaker that stopped
+        changing at least TURN_REOPEN_SECONDS ago."""
+        words = [w for w in (_wn(x) for x in text.split(" ")) if w]
+        if len(words) < GHOST_MIN_WORDS:
+            return False
+        sig = (speaker, tuple(words))
+        if sig in self._ghosts:
+            return True
+        joined = f" {' '.join(words)} "
+        for t in reversed(self.turns):
+            if t.speaker != speaker or now - t.changed < TURN_REOPEN_SECONDS or not t.toks:
+                continue
+            old = [w for w in t.norm() if w]
+            if joined in f" {' '.join(old)} " or (
+                    0.6 <= len(words) / max(1, len(old)) <= 1.7 and difflib.SequenceMatcher(
+                        None, old, words, autojunk=False).ratio() >= GHOST_SIMILARITY):
+                if len(self._ghosts) < 5000:
+                    self._ghosts.add(sig)
+                self.replay_skipped += 1
+                if not self._ghost_logged:
+                    self._ghost_logged = True
+                    log.info("Captions showed earlier lines again: skipping them")
+                return True
+        return False
+
+    def _settle_turns(self, now, seen, force=False):
+        """Save what has stopped changing; finish turns gone from the screen."""
+        newest = max((t.n for t in self.turns[-80:]), default=0)
+        for t in self.turns[-80:]:
+            if t.closed:
+                continue
+            if force or (t.n not in seen and now - t.seen >= TURN_CLOSE_SECONDS):
+                self._save_turn(t, now, final=True)
+                t.closed = True
+            else:
+                # still on screen, someone else spoke after it, and it stopped
+                # changing: save its last words too, even without a full stop
+                self._save_turn(t, now, final=t.n < newest and t.n in seen and
+                                now - t.changed >= TURN_DONE_SECONDS)
+        if len(self.turns) > 1500:
+            self.turns = self.turns[-1000:]
+
+    def _save_turn(self, t, now, final=False):
+        while True:
+            rest = t.toks[t.done:]
+            ends = [k for k, tok in enumerate(rest) if SENTENCE_END.search(tok)]
+            if not ends:
+                t.stable = []
+                if final and any(_wn(x) for x in rest):
+                    self._save_turn_line(t, rest, tail=True)
+                    t.done = len(t.toks)
+                return
+            sentences, begin = [], 0
+            for e in ends:
+                sentences.append(rest[begin:e + 1])
+                begin = e + 1
+            stable = []
+            for q, snt in enumerate(sentences):
+                sig = tuple(_wn(x) for x in snt)
+                stable.append(t.stable[q] if q < len(t.stable) and t.stable[q][0] == sig
+                              else (sig, now))
+            t.stable = stable
+            if not (final or len(sentences) >= TURN_FORCE_SENTENCES
+                    or now - stable[0][1] >= TURN_STABLE_SECONDS):
+                return
+            self._save_turn_line(t, sentences[0])
+            t.done += len(sentences[0])
+            t.stable = t.stable[1:]
+
+    def _save_turn_line(self, t, toks, tail=False):
+        sentence = " ".join(toks).strip()
+        words = tuple(re.findall(r"\w+", sentence.lower()))
+        if not words:
+            return
+        when = datetime.datetime.now()
+        if tail and t.last_entry is not None and t.last_entry < len(self.entries):
+            # unfinished last words: they belong at the end of this turn's last line,
+            # which keeps the conversation in order when someone else spoke since
+            at, line = self.entries[t.last_entry]
+            self.entries[t.last_entry] = (at, f"{line} {apply_vocabulary(sentence)}")
+            self._note_cues(sentence)
+            self.dirty = True
+            return
+        # the very same 6+ word line from this speaker in the last 10 min: a duplicate
+        if len(words) >= REPLAY_MIN_WORDS and any(
+                spk == t.speaker and prev == words and (when - tm).total_seconds() <= STALE_SECONDS
+                for tm, spk, prev, _ in self.recent_words):
+            self.replay_skipped += 1
+            return
+        text = apply_vocabulary(sentence)
+        self._remember(t.speaker, words)
+        self.entries.append((when, f"{t.speaker}: {text}" if t.speaker else text))
+        t.last_entry = len(self.entries) - 1
+        self.recent.append(norm(t.speaker + sentence))
+        self.recent.append(norm(sentence))
+        self.recent_words.append([when, t.speaker, words, len(self.entries) - 1])
+        self._last_key = norm(t.speaker + sentence)
+        self._note_cues(sentence)
+        self.dirty = True
 
     def _note_cues(self, sentence):
         if CUE_WORDS.search(sentence):
@@ -1030,6 +1420,8 @@ class Transcript:
             f"- {x['title']}" + (f" ({x['source']})" if x["source"] else "")
             + (f": {x['detail']}" if x["detail"] else "")
             + (f" {x['url']}" if x["url"] else "") for x in c["context"]))
+        if c.get("clean_transcript"):
+            lines += section("CLEANED TRANSCRIPT", c["clean_transcript"])
         lines.append("TRANSCRIPT")
         lines += [f"[{t.strftime('%H:%M:%S')}] {display_line(s)}" for t, s in self.entries
                   if not s.startswith(("YOU ASKED:", "CLAUDE:"))]
@@ -1087,14 +1479,17 @@ class Transcript:
                                  for i, q in enumerate(c["questions"], 1)],
             "context": [dict(x) for x in c["context"]],
             "transcript": spoken,
+            "transcript_clean": c.get("clean_transcript", ""),
             "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
         }
 
     def save_now(self):
         with self.lock:
             has_content = self.entries or any(
-                self.context[k] for k in ("title", "subject", "role", "goals",
+                self.context[k] for k in ("title", "subject", "goals",
                                           "participants", "agenda", "recap"))
+            # (the role alone carries over from the profile: not content, or every
+            # start and hand-over would save an empty meeting)
             if not has_content:
                 return
             try:
@@ -1118,6 +1513,12 @@ class Transcript:
     def _writer_loop(self):
         while True:
             time.sleep(3)
+            try:
+                with self.lock:
+                    if self.turns and not self.ended_at:
+                        self._settle_turns(_clock(), set())
+            except Exception as e:
+                log.info("Caption turns: %s", e)
             if self.dirty:
                 self.save_now()
 
@@ -1216,7 +1617,8 @@ class Transcript:
             f"Action items so far:\n{actions or '(none)'}\n"
             f"Questions to ask (saved for the user):\n{questions or '(none)'}\n"
             f"Context already found (Jira/Confluence):\n{ctx or '(none)'}\n"
-            f"Transcript source: {self.source or '(none yet)'}"
+            + (vocabulary_note() + "\n" if vocabulary_note() else "")
+            + f"Transcript source: {self.source or '(none yet)'}"
             f"{' - speaker names included' if self.source in ('Google Meet', 'Microsoft Teams') else ' - names only when Zoom shows them' if self.source == 'Zoom' else ''}\n"
             f"Meeting running for {minutes} min, {count} lines captured."
         )
@@ -1264,7 +1666,8 @@ def migrate_meeting(data):
                 "start": "", "end": "", "duration_min": None, "participants": [],
                 "agenda": [], "summary": "", "by_person": [], "decisions": [],
                 "open_questions": [], "action_items": [], "questions_to_ask": [],
-                "context": [], "transcript": [], "user_name": "", "role": "", "goals": ""}
+                "context": [], "transcript": [], "user_name": "", "role": "", "goals": "",
+                "transcript_clean": ""}
     for key, value in defaults.items():
         if data.get(key) is None:
             data[key] = value if not isinstance(value, list) else []
@@ -1507,6 +1910,8 @@ def import_old_meetings():
     count = 0
     live = os.path.normcase(transcript.file_path or "")
     for txt in glob.glob(os.path.join(SAVE_DIR, "*.txt")):
+        if os.path.basename(txt).lower() == VOCAB_NAME:
+            continue                                 # the user's vocabulary, not a meeting
         target = json_path_for(txt)
         if os.path.exists(target) or os.path.normcase(txt) == live:
             continue
@@ -2342,7 +2747,7 @@ class MeetCallWatcher:
         ui_queue.put(("toast", f"{app} call found: meeting started, turning on captions"))
 
 
-SIDENOTE_VERSION = "2026-11-17 v17"
+SIDENOTE_VERSION = "2026-11-20 v18"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -5216,7 +5621,71 @@ def core_save_recap(recap="", summary="", by_person="", decisions="", open_quest
 RECAP_LATER_DAYS = 14
 RECAP_LATER_MIN_LINES = 10          # shorter recordings are tests or false starts
 TXT_SECTIONS = ("SUMMARY", "BY PERSON", "DECISIONS", "ACTION ITEMS", "OPEN QUESTIONS",
-                "CONTEXT", "TRANSCRIPT")
+                "CONTEXT", "CLEANED TRANSCRIPT", "TRANSCRIPT")
+
+
+def _set_txt_section(text, header, body, before="TRANSCRIPT"):
+    """Replace a section of a meeting .txt, or add it just before another one."""
+    if header in text.split("\n"):
+        return _replace_txt_section(text, header, body)
+    lines = text.split("\n")
+    try:
+        i = lines.index(before)
+    except ValueError:
+        return text.rstrip("\n") + f"\n\n{header}\n{body.strip()}\n"
+    return "\n".join(lines[:i] + [header, body.strip(), ""] + lines[i:])
+
+
+CLEAN_MAX_PART = 60000         # characters per save_clean_transcript call
+
+
+def core_save_clean_transcript(text, meeting_id="", part=1):
+    """Store Claude's cleaned transcript next to the raw one (never replacing it).
+    Long meetings come in parts: part 1 starts over, later parts are appended."""
+    text = str(text or "").strip()
+    if not text:
+        return "Not saved: the cleaned transcript is empty."
+    try:
+        part = max(1, int(part))
+    except (TypeError, ValueError):
+        part = 1
+    meeting_id = str(meeting_id or "").strip()
+    if not meeting_id or meeting_id == transcript.meeting_id:
+        with transcript.lock:
+            c = transcript.context
+            c["clean_transcript"] = text if part == 1 else (c["clean_transcript"] + "\n" + text)
+            transcript.dirty = True
+            total = c["clean_transcript"]
+        transcript.save_now()
+        title = transcript.display_title() or "this meeting"
+        mid = transcript.meeting_id
+    else:
+        e = find_meeting(meeting_id)
+        if e is None:
+            return f"No meeting with id {meeting_id}. Use list_meetings to see ids."
+        with _history_lock:
+            d = load_meeting(e["path"])
+            path = d.pop("_path")
+            d["transcript_clean"] = text if part == 1 else (d.get("transcript_clean", "") + "\n" + text)
+            total = d["transcript_clean"]
+            _write_json(path, d)
+            txt = path[:-len(MEETING_EXT)] + ".txt" if path.endswith(MEETING_EXT) else ""
+            if txt and os.path.exists(txt) and not d.get("imported"):
+                try:
+                    with open(txt, encoding="utf-8") as f:
+                        body = f.read()
+                    body = _set_txt_section(body, "CLEANED TRANSCRIPT", total)
+                    with open(txt + ".tmp", "w", encoding="utf-8") as f:
+                        f.write(body)
+                    os.replace(txt + ".tmp", txt)
+                except OSError as ex:
+                    log.warning("Could not update %s: %s", txt, ex)
+        title, mid = e["title"], meeting_id
+    ui_queue.put(("history_changed", mid))
+    lines = len([l for l in total.splitlines() if l.strip()])
+    return (f"Saved part {part} of the cleaned transcript of \u201c{title}\u201d ({lines} lines so "
+            "far). The raw transcript is kept unchanged. Send the next part with part="
+            f"{part + 1}, or tell the user in one line that it's done.")
 
 
 def missing_recaps():
@@ -5369,7 +5838,7 @@ def _action_line(a):
     return f"[{a.get('status', 'open')}] {a['text']} — {meta}{closed}"
 
 
-def core_get_meeting(meeting_id, include_transcript=False):
+def core_get_meeting(meeting_id, include_transcript=False, cleaned=False):
     e = find_meeting(str(meeting_id).strip())
     if e is None:
         return f"No meeting with id {meeting_id}. Use list_meetings to find ids."
@@ -5401,6 +5870,15 @@ def core_get_meeting(meeting_id, include_transcript=False):
             f"- {q['id']} [{'asked' if q.get('asked') else 'not asked'}]: {q['text']}"
             for q in d["questions_to_ask"]))
     n = len(d["transcript"])
+    clean = (d.get("transcript_clean") or "").strip()
+    if cleaned and clean:
+        out.append("Cleaned transcript (made by Claude; the raw one is kept):\n" + clean)
+        return "\n".join(out)
+    if clean:
+        out.append("A cleaned transcript exists: get_meeting(meeting_id, cleaned=true) reads it.")
+    note = vocabulary_note()
+    if include_transcript and note:
+        out.append(note)
     if include_transcript and n:
         rows = d["transcript"][:2000]
         out.append(f"Transcript ({n} lines):\n" + "\n".join(
@@ -5653,6 +6131,8 @@ OPS = {
     "show_suggestion": core_show_suggestion,
     "list_meetings": core_list_meetings,
     "get_meeting": core_get_meeting,
+    "save_clean_transcript": core_save_clean_transcript,
+    "add_vocabulary": core_add_vocabulary,
     "find_items": core_find_items,
     "search_transcripts": core_search_transcripts,
     "update_item": core_update_item,
@@ -5987,11 +6467,39 @@ async def list_meetings(date_from: str = "", date_to: str = "", text: str = "") 
 
 
 @mcp.tool()
-async def get_meeting(meeting_id: str, include_transcript: bool = False) -> str:
+async def get_meeting(meeting_id: str, include_transcript: bool = False,
+                      cleaned: bool = False) -> str:
     """One saved meeting: recap, by person, decisions, open questions, action items
     (with item ids). The transcript is only included with include_transcript=true:
     use that only when the user asks for detail the recap doesn't have."""
-    return await run("get_meeting", meeting_id=meeting_id, include_transcript=include_transcript)
+    return await run("get_meeting", meeting_id=meeting_id, include_transcript=include_transcript, cleaned=cleaned)
+
+
+@mcp.tool()
+async def save_clean_transcript(text: str, meeting_id: str = "", part: int = 1) -> str:
+    """Save a cleaned version of a meeting's transcript, next to the raw one (the
+    raw transcript is never changed). Only when the user asks for it (e.g. 'clean
+    the transcript'). Read the raw one first: get_full_transcript for the meeting
+    just recorded, or get_meeting(meeting_id, include_transcript=true).
+    How to clean: keep every real sentence and its order; remove repeated and
+    partial versions of the same sentence (keep the most complete one); fix
+    punctuation and capitals; use the right spelling of names and terms (the
+    vocabulary listed with the transcript); one line per speaker turn:
+    '[HH:MM] Name: text'. Never summarize or shorten what was said. A short line
+    that looks like an echo of what the other person said a second before (e.g.
+    'Out perfume?' right after 'outperform'): keep it and add '(possible echo)'.
+    Long meetings: send it in parts of up to about 60,000 characters, in order:
+    part=1, then part=2, ... meeting_id: empty for the meeting just recorded."""
+    return await run("save_clean_transcript", text=text, meeting_id=meeting_id, part=part)
+
+
+@mcp.tool()
+async def add_vocabulary(term: str, heard_as: str = "") -> str:
+    """Add a name or term to the user's vocabulary (Documents/Sidenote/vocabulary.txt).
+    term: the right spelling (e.g. 'Pixelz'). heard_as: what the captions write
+    instead (e.g. 'Pixels'); new caption lines are corrected from then on. Without
+    heard_as it only tells Claude the right spelling. Saved meetings are not changed."""
+    return await run("add_vocabulary", term=term, heard_as=heard_as)
 
 
 @mcp.tool()
@@ -6988,7 +7496,7 @@ class Overlay:
         self._update_name_bar()
         self.toast("You can add your name later in ⋯ > Meeting info")
 
-    MENU_GLYPHS = {"info": "", "captions": "", "folder": "", "new": ""}
+    MENU_GLYPHS = {"info": "", "captions": "", "folder": "", "new": "", "vocab": "\ue82d", "raw": "\ue9d9"}
 
     def open_menu(self, event=None):
         """The ⋯ menu: a small dark panel under the button (not the system menu)."""
@@ -7002,6 +7510,9 @@ class Overlay:
             ("captions", "Show Live Captions" if captions_win.hide_wanted else "Hide Live Captions",
              self.toggle_captions, recording),
             ("folder", "Open meetings folder", self.open_folder, True),
+            ("vocab", "Names and terms\u2026", self.open_vocabulary, True),
+            ("raw", ("Save raw captions (testing): on" if raw_capture_on(refresh=True)
+                     else "Save raw captions (testing): off"), self.toggle_raw_capture, True),
             None,
             ("new", "New meeting", self.new_meeting, True),
         ]
@@ -7092,6 +7603,36 @@ class Overlay:
         if time.time() - getattr(self, "_menu_closed_at", 0) < 0.6:
             return
         self.edit_info()
+
+    def _open_file(self, path):
+        try:
+            if IS_MAC:
+                import subprocess
+                subprocess.Popen(["open", "-t", path])
+            else:
+                os.startfile(path)
+        except Exception as e:
+            self.toast(f"Could not open {os.path.basename(path)}: {e}")
+
+    def open_vocabulary(self):
+        """Names and terms the captions get wrong: a text file the user edits."""
+        vocabulary()                                 # creates it with examples
+        self._open_file(vocab_path())
+
+    def toggle_raw_capture(self):
+        flag = os.path.join(SAVE_DIR, RAW_FLAG)
+        try:
+            if raw_capture_on(refresh=True):
+                os.remove(flag)
+                self.toast("Raw captions: off")
+            else:
+                os.makedirs(SAVE_DIR, exist_ok=True)
+                with open(flag, "w") as f:
+                    f.write("Sidenote saves raw captions while this file exists.\n")
+                self.toast("Raw captions: saved in Documents/Sidenote/raw captions")
+        except OSError as e:
+            self.toast(f"Could not change it: {e}")
+        raw_capture_on(refresh=True)
 
     def open_folder(self):
         try:
@@ -7894,10 +8435,25 @@ class Overlay:
         n = len(d["transcript"])
         if n:
             t.insert("end", "Transcript\n", "section")
-            label = "Hide" if self.h_show_transcript else f"Show {n} lines"
-            t.insert("end", label + "\n", ("link", "tr"))
-            self._h_bind_row(t, "tr", self._h_toggle_transcript)
-            if self.h_show_transcript:
+            clean = (d.get("transcript_clean") or "").strip()
+            view = self.h_show_transcript              # False, True (raw) or "clean"
+            if clean:
+                t.insert("end", "Hide" if view == "clean" else "Show cleaned", ("link", "trc"))
+                self._h_bind_row(t, "trc", lambda: self._h_show_tr("clean"))
+                t.insert("end", "   \u00b7   ", "faint")
+            label = "Hide raw" if view is True else f"Show {n} raw lines" if clean else \
+                "Hide" if view else f"Show {n} lines"
+            t.insert("end", label, ("link", "tr"))
+            self._h_bind_row(t, "tr", lambda: self._h_show_tr(True))
+            if not clean and self.claude_connected():
+                t.insert("end", "   \u00b7   ", "faint")
+                t.insert("end", "Clean up with Claude", ("link", "trclean"))
+                self._h_bind_row(t, "trclean", lambda: self._h_ask_clean(d["id"]))
+            t.insert("end", "\n")
+            if view == "clean" and clean:
+                for line in clean.splitlines():
+                    t.insert("end", line + "\n")
+            elif view is True:
                 for r in d["transcript"]:
                     t.insert("end", f"{r['t'][:5]}  ", "meta")
                     if r["speaker"]:
@@ -7906,6 +8462,20 @@ class Overlay:
         if d["imported"]:
             t.insert("end", "\nSaved by an older Sidenote: some parts may be missing.\n", "meta")
         t.configure(state="disabled")
+
+    def _h_show_tr(self, which):
+        self.h_show_transcript = False if self.h_show_transcript == which else which
+        top = self.h_text.yview()[0]
+        self._h_render_detail()
+        self.h_text.yview_moveto(top)
+
+    def _h_ask_clean(self, meeting_id):
+        text = "Clean up the transcript of this meeting and save it (save_clean_transcript)."
+        question_queue.put({"text": text, "scope": "history", "meeting_id": meeting_id})
+        live.last_activity = time.time()
+        self._h_chat.append(("you", text))
+        self._h_waiting = True
+        self._h_render_chat()
 
     def _h_toggle_transcript(self):
         self.h_show_transcript = not self.h_show_transcript
