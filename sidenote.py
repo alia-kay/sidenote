@@ -2287,12 +2287,10 @@ class MacCaptionsWindow:
         Returns (switch found, switched by us). Does nothing when macOS already
         has Live Captions in the wanted state."""
         import subprocess
-        from AppKit import NSWorkspace
         if self.enabled() is on:
             return True, False
         def settings_apps():
-            return [a for a in NSWorkspace.sharedWorkspace().runningApplications()
-                    if str(a.bundleIdentifier() or "") == "com.apple.systempreferences"]
+            return mac_apps(("com.apple.systempreferences",))
         was_open = bool(settings_apps())
         subprocess.run(["open", "-g", self.SETTINGS_URL])
         switch, how = None, ""
@@ -2873,7 +2871,7 @@ class MeetCallWatcher:
         ui_queue.put(("toast", f"{app} call found: meeting started, turning on captions"))
 
 
-SIDENOTE_VERSION = "2026-11-22 v19"
+SIDENOTE_VERSION = "2026-11-22 v20"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -3123,7 +3121,7 @@ class MeetReader:
 # macOS: read Live Captions and Google Meet (Chrome) through the Accessibility API
 # ---------------------------------------------------------------------------
 if IS_MAC:
-    from AppKit import NSWorkspace
+    from AppKit import NSRunningApplication
     from ApplicationServices import (AXUIElementCreateApplication,
                                      AXUIElementCopyAttributeValue,
                                      AXUIElementSetAttributeValue,
@@ -3192,10 +3190,13 @@ if IS_MAC:
             yield from ax_walk(child, max_depth, depth + 1)
 
     def mac_apps(bundle_ids):
+        """The running apps with these bundle ids, asked of macOS each time.
+        NSWorkspace.runningApplications only updates while the main run loop
+        runs: once the Sidenote window has closed it never showed the System
+        Settings that Sidenote had just opened, so Live Captions stayed on."""
         out = []
-        for app in NSWorkspace.sharedWorkspace().runningApplications():
-            if str(app.bundleIdentifier() or "") in bundle_ids:
-                out.append(app)
+        for bundle_id in dict.fromkeys(bundle_ids):
+            out.extend(NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle_id))
         return out
 
     def mac_trusted(prompt=False):
