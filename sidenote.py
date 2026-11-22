@@ -2871,7 +2871,7 @@ class MeetCallWatcher:
         ui_queue.put(("toast", f"{app} call found: meeting started, turning on captions"))
 
 
-SIDENOTE_VERSION = "2026-11-22 v20"
+SIDENOTE_VERSION = "2026-11-22 v21"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -4661,12 +4661,19 @@ class MicTranscriber:
         segments, info = self._load().transcribe(
             audio, language=self.language, beam_size=1, vad_filter=False,
             condition_on_previous_text=False)
-        words = []
+        words, dropped = [], []
         for seg in segments:
             if seg.no_speech_prob > 0.6 or seg.avg_logprob < -1.0:
+                dropped.append(f"{seg.text.strip()!r} (no speech {seg.no_speech_prob:.2f}, "
+                               f"logprob {seg.avg_logprob:.2f})")
                 continue
             words.append(seg.text.strip())
         text = " ".join(w for w in words if w)
+        if not partial and not text:       # for troubleshooting a mic that hears no words
+            level = float((audio ** 2).mean() ** 0.5) if len(audio) else 0.0
+            log.info("Microphone: %.1f s phrase (level %.4f) gave no words: %s",
+                     len(audio) / self.RATE, level,
+                     "; ".join(dropped) if dropped else "Whisper heard nothing")
         # Auto-detect the language, then keep it once Whisper is sure: short
         # phrases are often mis-detected on their own.
         if self.language is None and text and not partial and \
@@ -4689,8 +4696,9 @@ class MicTranscriber:
         blocks = queue.Queue()
         try:
             self._load()
-            device = (sd.query_devices(kind="input") or {}).get("name")
-            log.info("Microphone: model ready, input device %r", device)
+            info = sd.query_devices(kind="input") or {}
+            log.info("Microphone: model ready, input device %r (%s Hz)", info.get("name"),
+                     info.get("default_samplerate"))
             stream = sd.InputStream(samplerate=self.RATE, channels=1, dtype="float32",
                                     blocksize=int(self.RATE * 0.1),
                                     callback=lambda data, frames, t, st: blocks.put(data.copy()))
@@ -4707,6 +4715,7 @@ class MicTranscriber:
         peak, peak_t, started = 0.0, time.time(), time.time()
         any_signal = False
         noise, speech, silence, heard = 0.004, [], 0.0, 0.0
+        short = 0                 # sounds too short to transcribe (for the log)
         partial_at = 0.0          # seconds of speech when the words were last shown
         try:
             while self.running.is_set():
@@ -4727,8 +4736,10 @@ class MicTranscriber:
                 level = float(np.sqrt(np.mean(block ** 2)))
                 peak = max(peak, level)
                 if time.time() - peak_t >= 30:
-                    log.info("Microphone: peak level last 30 s %.4f", peak)
-                    peak, peak_t = 0.0, time.time()
+                    log.info("Microphone: peak level last 30 s %.4f (room noise %.4f, speech "
+                             "above %.4f, %d short sound(s) skipped)", peak, noise,
+                             max(0.012, noise * 3.0), short)
+                    peak, peak_t, short = 0.0, time.time(), 0
                 talking = level > max(0.012, noise * 3.0)
                 if not talking and not speech:
                     noise = 0.95 * noise + 0.05 * level          # follow the room noise
@@ -4760,6 +4771,8 @@ class MicTranscriber:
                                 transcript.add_spoken("You", text)
                         except Exception as e:
                             log.info("Transcription error: %s", e)
+                    else:
+                        short += 1
                     speech, silence, heard, partial_at = [], 0.0, 0.0, 0.0
                     if transcript.pending.startswith("You: "):
                         transcript.pending = ""

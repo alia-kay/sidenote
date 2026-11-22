@@ -116,6 +116,7 @@ open_sidenote, close_sidenote, wait_for_question, show_suggestion, update_meetin
 - Teams on Mac (v17): the reader logs its status, and once per window the Teams element ids it saw (ids only), so a failed Teams test can be read from Claude's log.
 - Closing Sidenote switches macOS Live Captions off reliably (v16): Sidenote waits up to 15 s when System Settings has to start, checks the saved switch afterwards and retries once; Claude ending Sidenote with SIGTERM also runs this.
 - v20: Sidenote looks up System Settings and the other apps it reads by bundle id each time (NSRunningApplication). NSWorkspace's list of running apps only updates while the main run loop runs, so after the window had closed Sidenote never saw the System Settings it had just opened, and Live Captions stayed on.
+- v21: the log says why a mic phrase gave no words (its length and level, and what Whisper dropped: no-speech probability and confidence), the 30 s mic line adds the room noise, the speech threshold and how many short sounds were skipped, and the start line names the input device's sample rate.
 - Mac mic (v15): the hearing line shows your words while you talk (a quick Whisper pass every 1.5 s of speech); a phrase is saved after a pause or at 8 s (was 12 s, which with call audio from the speakers meant a 12 s delay).
 - Only one copy of Sidenote owns the window. Other chats talk to it locally (127.0.0.1).
 
