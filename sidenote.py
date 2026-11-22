@@ -2638,7 +2638,12 @@ class LiveCaptionsReader:
             self.status = "Live Captions connected"
             if raw != self.last_raw:
                 self.last_raw = raw
+                self.changed_at = time.time()
                 transcript.ingest(raw)
+            elif raw and raw != getattr(self, "settled_raw", None) and \
+                    time.time() - getattr(self, "changed_at", time.time()) >= LC_QUIET_SECONDS:
+                self.settled_raw = raw            # quiet: the last sentence is finished
+                transcript.ingest(raw, final=True)
             return True
         except Exception as e:
             if self.text_box is not None:
@@ -2649,6 +2654,127 @@ class LiveCaptionsReader:
 
 
 BROWSER_CLASSES = ("Chrome_WidgetWin_1",)       # Chrome, Edge, Brave, ...
+
+
+_TOP = {"at": 0.0, "list": None}
+_PROC_NAMES = {}
+
+
+def _top_windows():
+    """[(hwnd, class, title, pid)] of the visible top-level windows, read with Win32
+    (a few ms, cached 1 s). Asking UI Automation for every window's name, class
+    and process takes seconds on a busy desktop (VS Code, Claude, Spotify...).
+    None when UI Automation is a stand-in (tests) or on macOS."""
+    if IS_MAC or not hasattr(auto, "ControlFromHandle"):
+        return None
+    now = time.time()
+    if _TOP["list"] is not None and now - _TOP["at"] < 1.0:
+        return _TOP["list"]
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        found = []
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def each(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                cls = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls, 256)
+                n = user32.GetWindowTextLengthW(hwnd)
+                title = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, title, n + 1)
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                found.append((hwnd, cls.value, title.value, pid.value))
+            return True
+        user32.EnumWindows(proto(each), 0)
+    except Exception as e:
+        log.info("Window list (Win32) failed, using UI Automation: %s", e)
+        return None
+    _TOP.update(at=now, list=found)
+    return found
+
+
+def _proc_name(pid):
+    if pid not in _PROC_NAMES:
+        if len(_PROC_NAMES) > 500:
+            _PROC_NAMES.clear()
+        _PROC_NAMES[pid] = _win_process_name(pid)
+    return _PROC_NAMES[pid]
+
+
+def _desktop_windows(classes=None, procs=None, title=None):
+    """Top-level windows that match (window class, process name, a test on the
+    lower-case title), as UI Automation controls. Fast through Win32; the UI
+    Automation walk is the fallback."""
+    tops = _top_windows()
+    if tops is None:
+        for win in auto.GetRootControl().GetChildren():
+            try:
+                if classes and win.ClassName not in classes:
+                    continue
+                if title and not title((win.Name or "").strip().lower()):
+                    continue
+                if procs and _win_process_name(win.ProcessId) not in procs:
+                    continue
+                yield win
+            except Exception:
+                continue
+        return
+    for hwnd, cls, text, pid in tops:
+        if classes and cls not in classes:
+            continue
+        if title and not title(text.strip().lower()):
+            continue
+        if procs and _proc_name(pid) not in procs:
+            continue
+        try:
+            yield auto.ControlFromHandle(hwnd)
+        except Exception:
+            continue
+
+
+_TABS = {"at": 0.0, "names": []}
+TAB_CHECK_SECONDS = 30
+
+
+def _browser_tab_names():
+    """Names of the tabs in the browsers' tab strips (lower case), checked at most
+    every TAB_CHECK_SECONDS and shared by Zoom and Teams. Web pages are not
+    walked: tabs are in the browser's own bar."""
+    now = time.time()
+    if now - _TABS["at"] < TAB_CHECK_SECONDS:
+        return _TABS["names"]
+    _TABS["at"] = now
+    names = []
+    try:                                       # one UI Automation request per window
+        import uiautomation.uiautomation as _uia
+        cond = _uia._AutomationClient.instance().IUIAutomation.CreatePropertyCondition(
+            auto.PropertyId.ControlTypeProperty, auto.ControlType.TabItemControl)
+        for win in _desktop_windows(classes=BROWSER_CLASSES, procs=ZOOM_BROWSERS_WIN):
+            found = win.Element.FindAll(4, cond)            # 4 = all descendants
+            names += [(found.GetElement(i).CurrentName or "").lower() for i in range(found.Length)]
+        _TABS["names"] = names
+        return names
+    except Exception:
+        names = []                             # stand-in UI Automation: walk instead
+    for win in _desktop_windows(classes=BROWSER_CLASSES, procs=ZOOM_BROWSERS_WIN):
+        todo = [(win, 0)]
+        while todo:
+            c, d = todo.pop()
+            try:
+                kind = c.ControlTypeName
+                if kind == "TabItemControl":
+                    names.append((c.Name or "").lower())
+                    continue
+                if kind == "DocumentControl" or d >= 12:
+                    continue                          # the page itself: no tabs in there
+                todo.extend((child, d + 1) for child in c.GetChildren())
+            except Exception:
+                continue
+    _TABS["names"] = names
+    return names
 
 
 def _walk(control, max_depth, depth=0):
@@ -2747,7 +2873,7 @@ class MeetCallWatcher:
         ui_queue.put(("toast", f"{app} call found: meeting started, turning on captions"))
 
 
-SIDENOTE_VERSION = "2026-11-20 v18"
+SIDENOTE_VERSION = "2026-11-22 v19"
 auto_cc_status = {"text": ""}     # shown by get_status, for troubleshooting
 
 
@@ -2832,15 +2958,9 @@ class MeetReader:
         return meet_code(win.Name) if win is not None else ""
 
     def _find_meet_window(self):
-        for win in auto.GetRootControl().GetChildren():
-            try:
-                title = (win.Name or "").strip().lower()
-                if win.ClassName in BROWSER_CLASSES and (
-                        title.startswith("meet") or "google meet" in title
-                        or "meet.google.com" in title):
-                    return win
-            except Exception:
-                continue
+        for win in _desktop_windows(classes=BROWSER_CLASSES, title=lambda t: (
+                t.startswith("meet") or "google meet" in t or "meet.google.com" in t)):
+            return win
         return None
 
     def _find_region(self, win):
@@ -3330,7 +3450,12 @@ class MacLiveCaptionsReader:
             self.status = "Live Captions connected"
             if raw != self.last_raw:
                 self.last_raw = raw
+                self.changed_at = time.time()
                 transcript.ingest(raw, speaker="Others" if mic.status == "on" else "")
+            elif raw != getattr(self, "settled_raw", None) and \
+                    time.time() - getattr(self, "changed_at", time.time()) >= LC_QUIET_SECONDS:
+                self.settled_raw = raw            # quiet: the last sentence is finished
+                transcript.ingest(raw, speaker="Others" if mic.status == "on" else "", final=True)
             return True
         except Exception as e:
             log.info("Lost macOS Live Captions: %s", e)
@@ -3737,29 +3862,15 @@ class ZoomWebReader:
         a background tab, say so (a toast: it doesn't take focus)."""
         if now - getattr(self, "hint_at", 0) < self.HINT_EVERY:
             return
-        for win in auto.GetRootControl().GetChildren():
-            try:
-                if win.ClassName not in BROWSER_CLASSES or \
-                        _win_process_name(win.ProcessId) not in ZOOM_BROWSERS_WIN:
-                    continue
-                for c, _ in _walk(win, 12):
-                    if c.ControlTypeName == "TabItemControl" and \
-                            (c.Name or "").lower().startswith("zoom meeting"):
-                        self.hint_at = now
-                        ui_queue.put(("toast", "Zoom is in a background tab: bring it to "
-                                               "the front so Sidenote can read its captions"))
-                        return
-            except Exception:
-                continue
+        if any(name.startswith("zoom meeting") for name in _browser_tab_names()):
+            self.hint_at = now
+            ui_queue.put(("toast", "Zoom is in a background tab: bring it to "
+                                   "the front so Sidenote can read its captions"))
 
     def _find_window(self):
-        for win in auto.GetRootControl().GetChildren():
-            try:
-                if win.ClassName in BROWSER_CLASSES and "zoom" in (win.Name or "").lower() \
-                        and _win_process_name(win.ProcessId) in ZOOM_BROWSERS_WIN:
-                    return win
-            except Exception:
-                continue
+        for win in _desktop_windows(classes=BROWSER_CLASSES, procs=ZOOM_BROWSERS_WIN,
+                                    title=lambda t: "zoom" in t):
+            return win
         return None
 
     def _scan(self, root, want=None):
@@ -4071,31 +4182,15 @@ class TeamsReader:
         """A Teams meeting in a background browser tab can't be read: say so."""
         if now - getattr(self, "hint_at", 0) < self.HINT_EVERY:
             return
-        for win in auto.GetRootControl().GetChildren():
-            try:
-                if win.ClassName not in BROWSER_CLASSES or \
-                        _win_process_name(win.ProcessId) not in ZOOM_BROWSERS_WIN:
-                    continue
-                for c, _ in _walk(win, 12):
-                    if c.ControlTypeName == "TabItemControl" and \
-                            "microsoft teams" in (c.Name or "").lower():
-                        self.hint_at = now
-                        ui_queue.put(("toast", "Teams is in a background tab: bring it to "
-                                               "the front so Sidenote can read its captions"))
-                        return
-            except Exception:
-                continue
+        if any("microsoft teams" in name for name in _browser_tab_names()):
+            self.hint_at = now
+            ui_queue.put(("toast", "Teams is in a background tab: bring it to "
+                                   "the front so Sidenote can read its captions"))
 
     def _windows(self):
-        for win in auto.GetRootControl().GetChildren():
-            try:
-                proc = _win_process_name(win.ProcessId)
-                if proc in TEAMS_PROCESSES_WIN or (
-                        win.ClassName in BROWSER_CLASSES and proc in ZOOM_BROWSERS_WIN
-                        and "microsoft teams" in (win.Name or "").lower()):
-                    yield win
-            except Exception:
-                continue
+        yield from _desktop_windows(procs=TEAMS_PROCESSES_WIN)
+        yield from _desktop_windows(classes=BROWSER_CLASSES, procs=ZOOM_BROWSERS_WIN,
+                                    title=lambda t: "microsoft teams" in t)
 
     def call_key(self):
         """'teams:<window title>' while a Teams call shows its Leave button, else ''."""
@@ -4705,6 +4800,9 @@ def retry_mic():
         except Exception as e:
             log.info("Could not open Privacy settings: %s", e)
     mic.status = "off"
+
+
+LC_QUIET_SECONDS = 2.5        # Live Captions quiet this long: save its last words too
 
 
 def captions_loop():
@@ -7122,6 +7220,8 @@ class Overlay:
 
     def _apply_geometry(self, geometry):
         try:
+            if getattr(self, "screen", None) == "meetings":
+                return             # the user is on Past meetings: its own width applies
             if time.time() - self._opened_at < 3:      # only during start-up
                 # macOS Tk can keep laying out at the first tiny size while the
                 # real window is bigger (black area). Setting the same size is a
